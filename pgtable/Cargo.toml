@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Standalone copy of the SVSM kernel page table, set up for Verus verification.
+# It copies kernel/src/mm/pagetable.rs plus the minimal "core" dependencies and
+# provides trusted stubs for the hardware/allocator/platform glue, so the page
+# table logic can be verified in isolation with the `verus! { }` environment.
+
+[package]
+name = "pgtable"
+version = "0.1.0"
+edition.workspace = true
+description = "Standalone copy of the SVSM page table for Verus verification"
+
+[dependencies]
+bitflags.workspace = true
+zerocopy.workspace = true
+cpuarch.workspace = true
+log.workspace = true
+# No-op verus attribute/macro shims, used to neutralize the verus annotations on
+# the vendored "core" dependency modules so they are treated as trusted plain
+# Rust by the verifier.
+verus_macro_stub.workspace = true
+# Real-or-stub verus macros, used by the page-table module itself so that real
+# specs can be written incrementally inside `verus! { }`.
+verus_stub.workspace = true
+vstd = { workspace = true, optional = true }
+
+[features]
+default = []
+# Mirrors the kernel/paging wiring: turning on `verus` pulls in vstd and switches
+# verus_stub to re-export the real verus macros.
+verus = ["vstd", "verus_stub/disable"]
+
+[package.metadata.verus]
+verify = true
+
+[lints]
+workspace = true
