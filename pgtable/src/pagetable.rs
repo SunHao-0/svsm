@@ -531,6 +531,11 @@ impl PageTable {
     /// # Returns
     /// Some(PageFrame) if the virtual address is valid.
     /// None if the virtual address is not valid.
+    ///
+    /// Under verification this method is replaced by a verified version that
+    /// threads the self-map evidence (`SelfMapView`); see the `verus!` block at
+    /// the end of this file. The control flow is identical.
+    #[cfg(not(verus_only))]
     pub fn virt_to_frame(vaddr: VirtAddr) -> Option<PageFrame> {
         // Calculate the virtual addresses of each level of the paging
         // hierarchy in the self-map.
@@ -1528,3 +1533,98 @@ impl PageTablePart {
         self.get_mut().and_then(|r| r.unmap_2m(vaddr))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Verified `virt_to_frame` (self-map walk), built on the model in `crate::specs`.
+//
+// Same control flow as the `#[cfg(not(verus_only))]` version above; it threads
+// the self-map evidence so every read is permission-checked (no `unsafe`), and
+// proves the result agrees with the spec walk: it reports the page as mapped
+// (`Some`) exactly when the walk does (`vtf_level(..) is Some`).
+// ---------------------------------------------------------------------------
+// #[cfg(verus_only)]
+use vstd::prelude::*;
+// #[cfg(verus_only)]
+use crate::specs::{
+    SelfMapView, VPage, entry_huge, entry_present, lemma_node_at_root, lemma_root_entry_interior,
+    lemma_walk_step, page_frame_1g, page_frame_2m, page_frame_4k, pageframe_level, phys_add,
+    read_pte, vpn_of, vtf_level,
+};
+
+// #[cfg(verus_only)]
+verus! {
+
+// Trusted specs for the external (non-`verus!`) helpers `virt_to_frame` calls.
+// Their results are unconstrained: the correctness of the translation comes from
+// `read_pte`'s self-map contract, not from these address/offset computations.
+pub assume_specification [ PageTable::get_pte_address ](vaddr: VirtAddr) -> VirtAddr;
+
+pub assume_specification [ PTEntry::page_frame ](e: &PTEntry) -> PhysAddr;
+
+pub assume_specification [ <usize as core::convert::From<VirtAddr>>::from ](v: VirtAddr) -> usize;
+
+impl PageTable {
+    pub fn virt_to_frame(
+        vaddr: VirtAddr,
+        Tracked(sm): Tracked<&SelfMapView>,
+        Ghost(vpn): Ghost<VPage>,
+    ) -> (res: Option<PageFrame>)
+        requires
+            sm.wf(),
+            vpn == vpn_of(vaddr),
+        ensures
+            (res is Some) == (vtf_level(sm.mem(), sm.root(), vpn) is Some),
+            res is Some ==> pageframe_level(res->Some_0) == vtf_level(sm.mem(), sm.root(), vpn)->Some_0,
+    {
+        let pte_addr = Self::get_pte_address(vaddr);
+        let pde_addr = Self::get_pte_address(pte_addr);
+        let pdpe_addr = Self::get_pte_address(pde_addr);
+        let pml4e_addr = Self::get_pte_address(pdpe_addr);
+
+        proof {
+            lemma_node_at_root(sm.mem(), sm.root(), vpn);
+        }
+        let pml4e = read_pte(pml4e_addr, Tracked(sm), Ghost(vpn), Ghost(3));
+        if !entry_present(pml4e) {
+            return None;
+        }
+        proof {
+            lemma_root_entry_interior(sm.mem(), sm.root(), vpn);
+            lemma_walk_step(sm.mem(), sm.root(), vpn, 3);
+        }
+
+        let pdpe = read_pte(pdpe_addr, Tracked(sm), Ghost(vpn), Ghost(2));
+        if !entry_present(pdpe) {
+            return None;
+        }
+        if entry_huge(pdpe) {
+            let pa = phys_add(pdpe.page_frame(), usize::from(vaddr) & 0x3FFF_FFFF);
+            return Some(page_frame_1g(pa));
+        }
+        proof {
+            lemma_walk_step(sm.mem(), sm.root(), vpn, 2);
+        }
+
+        let pde = read_pte(pde_addr, Tracked(sm), Ghost(vpn), Ghost(1));
+        if !entry_present(pde) {
+            return None;
+        }
+        if entry_huge(pde) {
+            let pa = phys_add(pde.page_frame(), usize::from(vaddr) & 0x001F_FFFF);
+            return Some(page_frame_2m(pa));
+        }
+        proof {
+            lemma_walk_step(sm.mem(), sm.root(), vpn, 1);
+        }
+
+        let pte = read_pte(pte_addr, Tracked(sm), Ghost(vpn), Ghost(0));
+        if entry_present(pte) {
+            let pa = phys_add(pte.page_frame(), usize::from(vaddr) & 0xFFF);
+            Some(page_frame_4k(pa))
+        } else {
+            None
+        }
+    }
+}
+
+} // verus!

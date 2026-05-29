@@ -30,13 +30,175 @@
 // type declarations, `vaddr_maps_to`, `pte_decode`, and the four memory API
 // functions. Everything else is ordinary verified code.
 
-use crate::address::VirtAddr;
-use crate::pagetable::{PTEntry, PTPage};
-use crate::stubs::{PageBox, SvsmError};
+use crate::address::{Address, PhysAddr, VirtAddr};
+use crate::pagetable::{PTEntry, PTEntryFlags, PTPage, PageFrame, make_private_address};
+use crate::stubs::{PageBox, SvsmError, phys_to_virt};
+use core::marker::PhantomData;
 use core::ptr::NonNull;
 use vstd::prelude::*;
+use zerocopy::FromZeros;
 
 verus! {
+
+// =====================================================================
+// APointsTo - an address-keyed ownership permission (the "raw PointsTo")
+// =====================================================================
+//
+// Lower-level than vstd's `PointsTo<T>`: the caller is handed the RAW address
+// (`VA`/`PA` wrap a `usize`) so it can do address arithmetic (build PTE bits,
+// compute self-map addresses), while the tracked `APointsTo<T>` carries the
+// ownership and the tracked value. Keying by address + a trusted `ptv`
+// (phys->virt) relation sidesteps pointer provenance, which is what makes
+// reconstructing a node from a physical address verifiable.
+
+/// A physical address of a `T`.
+#[allow(missing_debug_implementations)]
+pub struct PA<T> {
+    pub addr: usize,
+    pub _pd: PhantomData<T>,
+}
+
+/// A virtual address of a `T`.
+#[allow(missing_debug_implementations)]
+pub struct VA<T> {
+    pub addr: usize,
+    pub _pd: PhantomData<T>,
+}
+
+/// Trusted physical->virtual mapping (the kernel direct map). Injective on owned
+/// pages, so a `PA` denotes a unique `VA`.
+pub uninterp spec fn ptv(pa: usize) -> usize;
+
+/// Ownership permission for the `T` stored at a physical address. Tracks the
+/// address identity and the value. Fields private: only `alloc_page` mints one.
+#[allow(missing_debug_implementations)]
+pub tracked struct APointsTo<T> {
+    addr_: usize,
+    value_: T,
+}
+
+impl<T> APointsTo<T> {
+    /// Physical address of the owned `T`.
+    pub closed spec fn pa(self) -> usize {
+        self.addr_
+    }
+
+    /// Virtual address of the owned `T` (its unique direct-map address).
+    pub closed spec fn va(self) -> usize {
+        ptv(self.addr_)
+    }
+
+    /// The tracked value.
+    pub closed spec fn value(self) -> T {
+        self.value_
+    }
+}
+
+/// Allocate a fresh zeroed page from the kernel heap, returning its virtual
+/// address and the ownership permission. No `unsafe` for the caller.
+/// (`FromZeros` triggers a benign "external trait" warning for now.)
+#[verifier::external_body]
+pub fn alloc_page<T: FromZeros + 'static>() -> (r: Result<(VA<T>, Tracked<APointsTo<T>>), SvsmError>)
+    ensures
+        r matches Ok((va, perm)) ==> va.addr == perm@.va(),
+{
+    let pb: PageBox<T> = PageBox::try_new_zeroed()?;
+    let vaddr = pb.vaddr();
+    let _leaked: &'static mut T = PageBox::leak(pb);
+    Ok((VA { addr: vaddr.bits(), _pd: PhantomData }, Tracked::assume_new()))
+}
+
+/// Borrow the content immutably through a virtual address that maps to the owned
+/// page. Replaces the `unsafe { &*vaddr.as_ptr() }` reconstruction.
+#[verifier::external_body]
+pub fn va_borrow<'a, T>(va: VA<T>, Tracked(perm): Tracked<&'a APointsTo<T>>) -> (r: &'a T)
+    requires
+        va.addr == perm.va(),
+    ensures
+        *r == perm.value(),
+{
+    // SAFETY: `perm` witnesses ownership of the `T` at `va` (= ptv(perm.pa())).
+    unsafe { &*(va.addr as *const T) }
+}
+
+/// Borrow the content mutably. The returned `&mut T` is tied to the `&mut`
+/// borrow of the permission, and the permission tracks the final content.
+/// Replaces `unsafe { &mut *vaddr.as_mut_ptr() }`.
+#[verifier::external_body]
+pub fn va_borrow_mut<'a, T>(va: VA<T>, Tracked(perm): Tracked<&'a mut APointsTo<T>>) -> (r: &'a mut T)
+    requires
+        va.addr == old(perm).va(),
+    ensures
+        *r == old(perm).value(),
+        final(perm).pa() == old(perm).pa(),
+        final(perm).value() == *r,
+{
+    // SAFETY: the exclusive `perm` witnesses sole ownership of the `T` at `va`.
+    unsafe { &mut *(va.addr as *mut T) }
+}
+
+// --- the same, keyed on the PHYSICAL address (the page-table code reaches a
+// --- child node by the PA stored in its parent entry) -----------------------
+
+/// Borrow the content immutably through the physical address. `ptv` resolves it
+/// to the page's direct-map virtual address.
+#[verifier::external_body]
+pub fn pa_borrow<'a, T>(pa: PA<T>, Tracked(perm): Tracked<&'a APointsTo<T>>) -> (r: &'a T)
+    requires
+        pa.addr == perm.pa(),
+    ensures
+        *r == perm.value(),
+{
+    // SAFETY: `perm` witnesses ownership of the `T` at physical `pa`.
+    let va = phys_to_virt(PhysAddr::from(pa.addr));
+    unsafe { &*(va.bits() as *const T) }
+}
+
+/// Borrow the content mutably through the physical address.
+#[verifier::external_body]
+pub fn pa_borrow_mut<'a, T>(pa: PA<T>, Tracked(perm): Tracked<&'a mut APointsTo<T>>) -> (r: &'a mut T)
+    requires
+        pa.addr == old(perm).pa(),
+    ensures
+        *r == old(perm).value(),
+        final(perm).pa() == old(perm).pa(),
+        final(perm).value() == *r,
+{
+    // SAFETY: the exclusive `perm` witnesses sole ownership of the `T` at `pa`.
+    let va = phys_to_virt(PhysAddr::from(pa.addr));
+    unsafe { &mut *(va.bits() as *mut T) }
+}
+
+// --- whole-value read / write (value tracking, like vstd PointsTo) ----------
+
+/// Read the whole value out by copy.
+#[verifier::external_body]
+pub fn pa_read<T: Copy>(pa: PA<T>, Tracked(perm): Tracked<&APointsTo<T>>) -> (v: T)
+    requires
+        pa.addr == perm.pa(),
+    ensures
+        v == perm.value(),
+{
+    let va = phys_to_virt(PhysAddr::from(pa.addr));
+    // SAFETY: `perm` witnesses ownership of the `T` at `pa`.
+    unsafe { *(va.bits() as *const T) }
+}
+
+/// Overwrite the whole value; the permission tracks the new value.
+#[verifier::external_body]
+pub fn pa_write<T>(pa: PA<T>, Tracked(perm): Tracked<&mut APointsTo<T>>, v: T)
+    requires
+        pa.addr == old(perm).pa(),
+    ensures
+        final(perm).pa() == old(perm).pa(),
+        final(perm).value() == v,
+{
+    let va = phys_to_virt(PhysAddr::from(pa.addr));
+    // SAFETY: the exclusive `perm` witnesses sole ownership of the `T` at `pa`.
+    unsafe {
+        *(va.bits() as *mut T) = v;
+    }
+}
 
 // =====================================================================
 // (0) Primitives
@@ -342,7 +504,17 @@ pub struct ExVirtAddr(VirtAddr);
 #[verifier::external_type_specification]
 #[verifier::external_body]
 #[allow(missing_debug_implementations)]
+pub struct ExPhysAddr(PhysAddr);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(missing_debug_implementations)]
 pub struct ExSvsmError(SvsmError);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(missing_debug_implementations)]
+pub struct ExPageFrame(PageFrame);
 
 /// MMU translation relation: virtual address `va` denotes (the base of) physical
 /// node `pfn`. A node's `PageBox` VA and its self-map VA both satisfy this for
@@ -463,6 +635,124 @@ pub fn node_free(p: NodePtr, Tracked(perm): Tracked<PointsToNode>)
     let ptr = p.vaddr.as_mut_ptr::<PTPage>();
     let nn = unsafe { NonNull::new_unchecked(ptr) };
     let _ = unsafe { PageBox::from_raw(nn) };
+}
+
+// --- trusted PTE decode / encode / navigation accessors -------------
+// These let verified code branch on, build, and navigate through concrete
+// `PTEntry`s while staying tied to `pte_decode`. They wrap the architectural
+// PTE operations; each is trusted to agree with `pte_decode`.
+
+/// Is the entry present?
+#[verifier::external_body]
+pub fn entry_present(e: PTEntry) -> (b: bool)
+    ensures
+        b == pte_decode(e).present,
+{
+    e.present()
+}
+
+/// Is the entry a huge/leaf entry (HUGE bit set)? Note: a level-0 PTE is a leaf
+/// positionally even though this is `false`; the walk uses `level == 0 || leaf`.
+#[verifier::external_body]
+pub fn entry_huge(e: PTEntry) -> (b: bool)
+    ensures
+        b == pte_decode(e).leaf,
+{
+    e.huge()
+}
+
+/// The frame number stored in the entry (child table or mapped frame).
+#[verifier::external_body]
+pub fn entry_target_frame(e: PTEntry) -> (f: usize)
+    ensures
+        f as nat == pte_decode(e).target,
+{
+    e.address().bits() >> 12
+}
+
+/// Handle to the child node a present interior entry points at. Replaces
+/// `from_entry`/`from_vaddr`: the `phys_to_virt` conversion is what convinces the
+/// verifier (`vaddr_maps_to`) that this address denotes the child node.
+#[verifier::external_body]
+pub fn entry_child(e: PTEntry) -> (p: NodePtr)
+    ensures
+        vaddr_maps_to(p.vaddr, pte_decode(e).target),
+{
+    NodePtr { vaddr: phys_to_virt(e.address()) }
+}
+
+/// Build a private 4 KiB leaf PTE for `frame`. A/D are pre-set (pinned), so the
+/// MMU never writes back (see `ad_pinned`).
+#[verifier::external_body]
+pub fn make_4k_leaf(frame: usize, writable: bool) -> (e: PTEntry)
+    ensures
+        pte_decode(e) == (Entry {
+            present: true,
+            leaf: false,
+            target: frame as nat,
+            w: writable,
+            user: false,
+            nx: true,
+            global: true,
+            enc: true,
+            accessed: true,
+            dirty: writable,
+        }),
+{
+    let mut flags = PTEntryFlags::PRESENT | PTEntryFlags::GLOBAL | PTEntryFlags::NX
+        | PTEntryFlags::ACCESSED;
+    if writable {
+        flags = flags | PTEntryFlags::WRITABLE | PTEntryFlags::DIRTY;
+    }
+    let pa = make_private_address(PhysAddr::from(frame << 12));
+    let mut e = PTEntry::new_zeroed();
+    e.set_unrestricted(pa, flags);
+    e
+}
+
+/// A cleared (not-present) entry, for unmap.
+#[verifier::external_body]
+pub fn absent_entry() -> (e: PTEntry)
+    ensures
+        !pte_decode(e).present,
+{
+    PTEntry::new_zeroed()
+}
+
+/// The paging level of a `PageFrame` (0 = 4K, 1 = 2M, 2 = 1G).
+pub uninterp spec fn pageframe_level(pf: PageFrame) -> nat;
+
+// Trusted constructors for the opaque `PageFrame` (Verus cannot build an
+// external datatype directly). The values are identical to the enum variants.
+#[verifier::external_body]
+pub fn page_frame_4k(pa: PhysAddr) -> (r: PageFrame)
+    ensures
+        pageframe_level(r) == 0nat,
+{
+    PageFrame::Size4K(pa)
+}
+
+#[verifier::external_body]
+pub fn page_frame_2m(pa: PhysAddr) -> (r: PageFrame)
+    ensures
+        pageframe_level(r) == 1nat,
+{
+    PageFrame::Size2M(pa)
+}
+
+#[verifier::external_body]
+pub fn page_frame_1g(pa: PhysAddr) -> (r: PageFrame)
+    ensures
+        pageframe_level(r) == 2nat,
+{
+    PageFrame::Size1G(pa)
+}
+
+/// Trusted `PhysAddr + usize` (the page offset add). Result is unconstrained;
+/// it only affects the returned address, not the mapped/unmapped verdict.
+#[verifier::external_body]
+pub fn phys_add(a: PhysAddr, b: usize) -> PhysAddr {
+    a + b
 }
 
 /// Connect the permission set to the conceptual map: a held node's value is
@@ -606,6 +896,184 @@ pub open spec fn confidential(arch: Arch, mem: PTMem, root: PFN, host_shared: Se
             let w = walk(arch, mem, root, vpn)->Some_0;
             (!w.enc) <==> walk_frames(w).subset_of(host_shared)
         }
+}
+
+// =====================================================================
+// (3b) Self-map model - for verifying `PageTable::virt_to_frame`
+// =====================================================================
+//
+// `virt_to_frame` reads the paging hierarchy top-down through the recursive
+// self-map (idx 493): `read_pte` at the self-map address of level `L` returns
+// exactly the entry the MMU walk reads at level `L`. We model that as trusted
+// evidence (`SelfMapView`) plus a `read_pte` contract, and prove `virt_to_frame`
+// returns the same result as `walk`.
+
+/// The node reached by descending from `root` (level 3) to `level` for `vpn`,
+/// following present interior entries.
+pub open spec fn node_at(mem: PTMem, root: PFN, vpn: VPage, level: nat) -> Option<PFN>
+    decreases ROOT_LEVEL - level,
+{
+    if level >= ROOT_LEVEL {
+        Some(root)
+    } else {
+        match node_at(mem, root, vpn, level + 1) {
+            Some(parent) => {
+                if mem.nodes.dom().contains(parent) {
+                    let e = mem.nodes[parent].e[pt_index(vpn, level + 1)];
+                    if e.present && !e.leaf {
+                        Some(e.target)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            },
+            None => None,
+        }
+    }
+}
+
+/// The entry the walk reads at `level` for `vpn`.
+pub open spec fn entry_at(mem: PTMem, root: PFN, vpn: VPage, level: nat) -> Option<Entry> {
+    match node_at(mem, root, vpn, level) {
+        Some(n) => if mem.nodes.dom().contains(n) {
+            Some(mem.nodes[n].e[pt_index(vpn, level)])
+        } else {
+            None
+        },
+        None => None,
+    }
+}
+
+/// Trusted evidence that page table `mem` rooted at `root` is installed and
+/// self-mapped. Read-only, shareable.
+#[allow(missing_debug_implementations)]
+pub tracked struct SelfMapView {
+    mem_: PTMem,
+    root_: PFN,
+}
+
+impl SelfMapView {
+    pub closed spec fn mem(self) -> PTMem {
+        self.mem_
+    }
+
+    pub closed spec fn root(self) -> PFN {
+        self.root_
+    }
+
+    pub open spec fn wf(self) -> bool {
+        &&& wf(self.mem())
+        &&& self.mem().nodes.dom().contains(self.root())
+        &&& self.mem().level.dom().contains(self.root())
+        &&& self.mem().level[self.root()] == ROOT_LEVEL
+    }
+}
+
+/// The page number a virtual address belongs to (`vaddr >> 12`).
+pub uninterp spec fn vpn_of(va: VirtAddr) -> VPage;
+
+/// Trusted self-map read: reading the PTE at the self-map address `addr` for the
+/// level-`level` entry of `vpn` returns that entry. Replaces the `unsafe`
+/// `PTEntry::read_pte`. The caller passes the ghost `(vpn, level)` it computed
+/// the address for; `node_at(..) is Some` says the path to that node exists.
+#[verifier::external_body]
+pub fn read_pte(
+    addr: VirtAddr,
+    Tracked(sm): Tracked<&SelfMapView>,
+    Ghost(vpn): Ghost<VPage>,
+    Ghost(level): Ghost<nat>,
+) -> (r: PTEntry)
+    requires
+        sm.wf(),
+        level <= ROOT_LEVEL,
+        node_at(sm.mem(), sm.root(), vpn, level) is Some,
+        sm.mem().nodes.dom().contains(node_at(sm.mem(), sm.root(), vpn, level)->Some_0),
+    ensures
+        pte_decode(r) == entry_at(sm.mem(), sm.root(), vpn, level)->Some_0,
+{
+    // SAFETY: `sm` witnesses that the page table is installed and self-mapped,
+    // and `addr` is the self-map address of the level-`level` entry of `vpn`, so
+    // this read returns that entry.
+    unsafe { *addr.as_ptr::<PTEntry>() }
+}
+
+/// Specification of `virt_to_frame`'s result: descend top-down from level 3,
+/// stop at the first present leaf (or level-0 page), giving its level. `None`
+/// if the page is not mapped.
+pub open spec fn vtf_level(mem: PTMem, root: PFN, vpn: VPage) -> Option<nat> {
+    let e3 = entry_at(mem, root, vpn, 3);
+    let e2 = entry_at(mem, root, vpn, 2);
+    let e1 = entry_at(mem, root, vpn, 1);
+    let e0 = entry_at(mem, root, vpn, 0);
+    if e3 is None || !e3->Some_0.present {
+        None
+    } else if e2 is None || !e2->Some_0.present {
+        None
+    } else if e2->Some_0.leaf {
+        Some(2nat)
+    } else if e1 is None || !e1->Some_0.present {
+        None
+    } else if e1->Some_0.leaf {
+        Some(1nat)
+    } else if e0 is Some && e0->Some_0.present {
+        Some(0nat)
+    } else {
+        None
+    }
+}
+
+/// The walk reaches the root at the top level.
+pub proof fn lemma_node_at_root(mem: PTMem, root: PFN, vpn: VPage)
+    ensures
+        node_at(mem, root, vpn, ROOT_LEVEL) == Some(root),
+{
+}
+
+/// A present level-3 (PML4) entry is never a leaf (no 512 GB pages), so the walk
+/// descends. Needs the root to actually sit at the top level.
+pub proof fn lemma_root_entry_interior(mem: PTMem, root: PFN, vpn: VPage)
+    requires
+        wf(mem),
+        mem.nodes.dom().contains(root),
+        mem.level.dom().contains(root),
+        mem.level[root] == ROOT_LEVEL,
+        entry_at(mem, root, vpn, ROOT_LEVEL) is Some,
+        entry_at(mem, root, vpn, ROOT_LEVEL)->Some_0.present,
+    ensures
+        !entry_at(mem, root, vpn, ROOT_LEVEL)->Some_0.leaf,
+{
+    lemma_node_at_root(mem, root, vpn);
+    let idx = pt_index(vpn, ROOT_LEVEL);
+    assert(node_wf(mem, root));
+    assert(mem.nodes[root].e[idx].present);
+}
+
+/// One descent step: from a node with a present interior entry, the next level's
+/// node exists and is in the store.
+pub proof fn lemma_walk_step(mem: PTMem, root: PFN, vpn: VPage, level: nat)
+    requires
+        wf(mem),
+        1 <= level <= ROOT_LEVEL,
+        node_at(mem, root, vpn, level) is Some,
+        mem.nodes.dom().contains(node_at(mem, root, vpn, level)->Some_0),
+        entry_at(mem, root, vpn, level)->Some_0.present,
+        !entry_at(mem, root, vpn, level)->Some_0.leaf,
+    ensures
+        node_at(mem, root, vpn, (level - 1) as nat) is Some,
+        mem.nodes.dom().contains(node_at(mem, root, vpn, (level - 1) as nat)->Some_0),
+{
+    let n = node_at(mem, root, vpn, level)->Some_0;
+    let idx = pt_index(vpn, level);
+    let e = mem.nodes[n].e[idx];
+    assert(entry_at(mem, root, vpn, level)->Some_0 == e);
+    assert(node_wf(mem, n));
+    // node_at(level-1) unfolds via node_at((level-1)+1) == node_at(level) == Some(n).
+    assert(node_at(mem, root, vpn, (level - 1) as nat) == Some(e.target));
+    // e is a present interior entry, so node_wf gives e.target in the store
+    // (level-decrease branch) or e.target == n (self-map branch); n is in the store.
+    assert(mem.nodes.dom().contains(e.target));
 }
 
 } // verus!
