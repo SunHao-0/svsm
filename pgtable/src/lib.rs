@@ -31,6 +31,7 @@ pub mod stubs;
 // The verification target.
 pub mod pagetable;
 
-// Verus specs/proofs (only compiled under verification).
+// Verus page-table model: conceptual tree map + value-tracking permissions +
+// properties. The single home for `verus! { }` specs/proofs for this crate.
 #[cfg(verus_only)]
 pub mod specs;

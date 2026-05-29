@@ -1,56 +1,67 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// Verus specifications for the SVSM address space.
+// A Verus model of the x86-64 page table, for verifying `crate::pagetable`.
 //
-// This module is only compiled under verification (`verus_only`).
+// Compiled only under verification (`verus_only`).
 //
-// It contains a *spec-level* (mathematical) model of the SVSM virtual address
-// space, deliberately abstracting away the concrete page-table tree. The model
-// is the semantic target that `crate::pagetable` will later be proven to refine.
+// The MMU is trusted: from its perspective the page table is a TREE (a graph
+// over physical frames; the self-map makes it cyclic, but every walk is bounded
+// by the paging level). So the canonical object is that tree, and translation is
+// what the MMU computes by walking it. The implementation's concrete
+// `PTPage`/`PTEntry` memory maps directly onto this tree, one `PTNode` per frame.
 //
-// Design decisions (agreed up front):
-//   * leaves are **size-tagged** (4K / 2M / 1G), not normalized to 4K pages;
-//   * the **TLB / multi-CPU** layer is modeled from the start;
-//   * the model lives in the standalone `pgtable/` crate.
+// The file is organized in three layers:
 //
-// The model is organized in four layers (see the module-level comment blocks):
-//   L0  address / frame primitives
-//   L1  RegionMap     - the pure translation content of one PageTablePart subtree
-//   L2  region typing - the PerCpu / Shared / PerTask / User / SelfMap distinction
-//   L3  System + TLB  - the CPU fleet, per-CPU TLBs, flush modes, and the
-//                       top-level confidentiality property.
+//   (1) CONCEPTUAL MAP - the tree the MMU sees (`PTMem`), the walk it performs
+//       (`walk`), and the structural well-formedness (`wf`). All translation and
+//       permission combination live here.
 //
-// NOTE: this file states the model and the invariants/goals. The refinement of
-// `pagetable.rs` onto L1 and the proofs of invariant preservation across the L3
-// transitions are the next phases; they are intentionally not attempted here.
+//   (2) PERMISSIONS - a `PointsTo`-style ownership token (`PointsToNode`) that,
+//       like vstd's `PointsTo<V>`, tracks BOTH the access right AND the node's
+//       value (`value() : PTNode`). A set of these tokens *is* a `PTMem`
+//       (`perms_view`). A small trusted memory API (`pte_read`/`pte_write`/
+//       `node_alloc`/`node_free`) lets `pagetable.rs` drop all `unsafe`.
+//
+//   (3) PROPERTIES - region typing, the A/D ownership discipline (struct bits are
+//       software-exclusive; A/D are co-owned with the MMU and monotone), and the
+//       confidentiality goal.
+//
+// Trusted surface (audited once, replaces all page-table `unsafe`): the external
+// type declarations, `vaddr_maps_to`, `pte_decode`, and the four memory API
+// functions. Everything else is ordinary verified code.
 
+use crate::address::VirtAddr;
+use crate::pagetable::{PTEntry, PTPage};
+use crate::stubs::{PageBox, SvsmError};
+use core::ptr::NonNull;
 use vstd::prelude::*;
 
 verus! {
 
 // =====================================================================
-// L0 - Address and frame primitives
+// (0) Primitives
 // =====================================================================
 
 /// Virtual page number (`vaddr >> 12`).
 pub type VPage = nat;
 
-/// Physical frame number (`paddr >> 12`).
+/// Physical frame number (`paddr >> 12`); also the identity of a `PTNode`.
 pub type PFN = nat;
 
-/// Logical CPU identifier.
-pub type CpuId = nat;
+/// Entries per node, and the top paging level (PML4 = level 3).
+pub spec const ENTRIES: nat = 512;
 
-/// Task identifier (selects the PerTask/User subtree mounted under a CR3).
-pub type TaskId = nat;
+pub spec const ROOT_LEVEL: nat = 3;
 
-/// Entries per page-table page on x86-64 4-level paging.
-pub spec const ENTRIES_PER_TABLE: nat = 512;
+/// Top-level (PML4) indices that partition the address space (`address_space.rs`).
+pub spec const IDX_PERTASK: nat = 508;
 
-/// Pages spanned by one top-level (PML4 / level-3) slot = 512^3 4K pages.
-pub spec const PML4_SLOT_PAGES: nat = 512 * 512 * 512;
+pub spec const IDX_SELFMAP: nat = 493;
 
-/// Leaf page sizes supported by the hardware.
+pub spec const IDX_PERCPU: nat = 510;
+
+pub spec const IDX_SHARED: nat = 511;
+
 #[derive(PartialEq, Eq, Structural, Debug)]
 pub enum PageSz {
     Size4K,
@@ -59,7 +70,7 @@ pub enum PageSz {
 }
 
 impl PageSz {
-    /// Number of 4K pages covered by a leaf of this size.
+    /// 4K pages spanned by a leaf of this size.
     pub open spec fn pages(self) -> nat {
         match self {
             PageSz::Size4K => 1,
@@ -69,135 +80,408 @@ impl PageSz {
     }
 }
 
+/// 4K pages spanned by one entry at paging `level` (= 512^level).
+pub open spec fn span(level: nat) -> nat
+    decreases level,
+{
+    if level == 0 {
+        1
+    } else {
+        512 * span((level - 1) as nat)
+    }
+}
+
+pub open spec fn size_of_level(level: nat) -> PageSz {
+    if level == 0 {
+        PageSz::Size4K
+    } else if level == 1 {
+        PageSz::Size2M
+    } else {
+        PageSz::Size1G
+    }
+}
+
+/// Page-table index used at `level` for page `vpn` = `(vpn / 512^level) % 512`,
+/// matching `VirtAddr::to_pgtbl_idx::<level>`.
+pub open spec fn pt_index(vpn: VPage, level: nat) -> nat {
+    (vpn / span(level)) % ENTRIES
+}
+
 // =====================================================================
-// L1 - RegionMap: the pure translation content of one subtree
+// (1) The conceptual map: the tree the MMU walks
 // =====================================================================
 
-/// The semantically-meaningful attributes of one leaf mapping.
-///
-/// `present`/`accessed`/`dirty`/`huge` from the concrete PTE are *not* carried:
-/// presence is encoded by membership in the [`RegionMap`], and the huge bit is
-/// subsumed by [`MapEntry::size`]. What remains are the access-control and
-/// confidentiality attributes that the security argument depends on.
+/// One decoded page-table entry - the information the MMU extracts from the
+/// 8-byte word. The fields split by owner:
+///   * STRUCTURAL (software-written): present, leaf, target, w, user, nx, global, enc
+///   * STATUS (co-owned with the MMU, monotone): accessed, dirty
 #[allow(missing_debug_implementations)]
-pub struct MapEntry {
-    /// Starting physical frame number backing the leaf.
-    pub frame: PFN,
-    /// Leaf size (determines how many pages the entry covers).
-    pub size: PageSz,
-    /// Writable (PTE `WRITABLE`).
+pub struct Entry {
+    pub present: bool,
+    /// `true` = leaf (maps `target` as a frame); `false` = interior (child table).
+    pub leaf: bool,
+    /// Child node PFN (interior) or mapped base frame PFN (leaf).
+    pub target: PFN,
     pub w: bool,
-    /// Executable (PTE `NX` cleared).
-    pub x: bool,
-    /// User-accessible (PTE `USER`).
     pub user: bool,
-    /// Survives a CR3 reload (PTE `GLOBAL`).
+    pub nx: bool,
     pub global: bool,
-    /// Confidentiality state: `true` = private (C-bit set, guest-confidential),
-    /// `false` = shared (host/hypervisor-visible).
-    pub encrypted: bool,
+    /// C-bit: `true` = private, `false` = host-shared.
+    pub enc: bool,
+    pub accessed: bool,
+    pub dirty: bool,
 }
 
-/// The translation content of one `PageTablePart` subtree, abstracted away from
-/// the page-table tree: a partial map from a leaf's *start* page to its entry.
-/// A leaf keyed at `k` covers `[k, k + e.size.pages())`.
+/// A node: 512 entries (indices `0..512`).
 #[allow(missing_debug_implementations)]
-pub struct RegionMap {
-    pub leaves: Map<VPage, MapEntry>,
+pub struct PTNode {
+    pub e: Map<nat, Entry>,
 }
 
-/// Does the leaf keyed at `start` cover virtual page `vp`?
-pub open spec fn covers(start: VPage, e: MapEntry, vp: VPage) -> bool {
-    start <= vp < start + e.size.pages()
+/// The page-table memory the MMU sees: the frames that are nodes, their decoded
+/// contents, and the paging level each node sits at.
+#[allow(missing_debug_implementations)]
+pub struct PTMem {
+    pub nodes: Map<PFN, PTNode>,
+    pub level: Map<PFN, nat>,
 }
 
-/// Do two leaves overlap in the virtual page space?
-pub open spec fn leaves_overlap(k1: VPage, e1: MapEntry, k2: VPage, e2: MapEntry) -> bool {
-    k1 < k2 + e2.size.pages() && k2 < k1 + e1.size.pages()
+/// Effective access permission produced by a walk.
+#[derive(PartialEq, Eq, Structural, Debug)]
+pub struct Perm {
+    pub r: bool,
+    pub w: bool,
+    pub x: bool,
+    pub user: bool,
 }
 
-/// A single leaf is well-formed when its start and backing frame are aligned to
-/// the leaf size (so the page offset is preserved by the linear translation).
-pub open spec fn entry_wf(start: VPage, e: MapEntry) -> bool {
-    &&& start % e.size.pages() == 0
-    &&& e.frame % e.size.pages() == 0
+/// The result of translating a page.
+#[allow(missing_debug_implementations)]
+pub struct Walk {
+    pub frame: PFN,
+    pub size: PageSz,
+    pub perm: Perm,
+    pub enc: bool,
+    pub global: bool,
 }
 
-/// A region map is well-formed when every leaf is well-formed and no two
-/// distinct leaves overlap.
-pub open spec fn region_wf(rm: RegionMap) -> bool {
-    &&& forall|k: VPage| #[trigger]
-        rm.leaves.dom().contains(k) ==> entry_wf(k, rm.leaves[k])
-    &&& forall|k1: VPage, k2: VPage|
-        (#[trigger] rm.leaves.dom().contains(k1) && #[trigger] rm.leaves.dom().contains(k2) && k1
-            != k2) ==> !leaves_overlap(k1, rm.leaves[k1], k2, rm.leaves[k2])
+// --- architecture-parameterized permission combination ---------------
+//
+// The effective permission is combined over EVERY entry on the walk (parents +
+// leaf). The rule is architecture specific: x86 intersects (AND), an ARM-like
+// arch unions (OR). The model never bakes in leaf-only semantics.
+
+#[derive(PartialEq, Eq, Structural, Debug)]
+pub enum Arch {
+    X86,
+    ArmLike,
 }
 
-/// Translate a virtual page through a region map: find the covering leaf (if
-/// any) and apply the linear offset to its base frame.
-pub open spec fn region_translate(rm: RegionMap, vp: VPage) -> Option<(PFN, MapEntry)> {
-    if exists|k: VPage| #[trigger] rm.leaves.dom().contains(k) && covers(k, rm.leaves[k], vp) {
-        let k = choose|k: VPage|
-            #[trigger] rm.leaves.dom().contains(k) && covers(k, rm.leaves[k], vp);
-        let e = rm.leaves[k];
-        Some(((e.frame + (vp - k)) as nat, e))
-    } else {
+pub open spec fn perm_identity(arch: Arch) -> Perm {
+    match arch {
+        Arch::X86 => Perm { r: true, w: true, x: true, user: true },
+        Arch::ArmLike => Perm { r: false, w: false, x: false, user: false },
+    }
+}
+
+pub open spec fn combine_step(arch: Arch, acc: Perm, e: Entry) -> Perm {
+    match arch {
+        Arch::X86 => Perm {
+            r: acc.r && e.present,
+            w: acc.w && e.present && e.w,
+            x: acc.x && e.present && !e.nx,
+            user: acc.user && e.present && e.user,
+        },
+        Arch::ArmLike => Perm {
+            r: acc.r || e.present,
+            w: acc.w || (e.present && e.w),
+            x: acc.x || (e.present && !e.nx),
+            user: acc.user || (e.present && e.user),
+        },
+    }
+}
+
+/// The permission a single (leaf) entry grants on its own.
+pub open spec fn leaf_only_perm(e: Entry) -> Perm {
+    Perm { r: e.present, w: e.present && e.w, x: e.present && !e.nx, user: e.present && e.user }
+}
+
+/// The MMU walk from `node` at `level` for page `vpn`, accumulating permission.
+/// Bounded by `level`, so it terminates even though the self-map makes the graph
+/// cyclic.
+pub open spec fn walk_from(
+    arch: Arch,
+    mem: PTMem,
+    node: PFN,
+    level: nat,
+    vpn: VPage,
+    acc: Perm,
+) -> Option<Walk>
+    decreases level,
+{
+    if !mem.nodes.dom().contains(node) {
         None
-    }
-}
-
-// --- L1 pure updates (the abstract effect of pagetable.rs operations) -------
-
-/// Abstract `map_*`: install a leaf. (Refinement target for `map_4k`/`map_2m`.)
-pub open spec fn region_map_leaf(rm: RegionMap, start: VPage, e: MapEntry) -> RegionMap {
-    RegionMap { leaves: rm.leaves.insert(start, e) }
-}
-
-/// Abstract `unmap_*`: remove a leaf.
-pub open spec fn region_unmap_leaf(rm: RegionMap, start: VPage) -> RegionMap {
-    RegionMap { leaves: rm.leaves.remove(start) }
-}
-
-/// Abstract `set_shared_4k` / `set_encrypted_4k`: flip a leaf's C-bit.
-/// (`do_split_4k` is invisible here: splitting a 2M leaf into 512 identical 4K
-/// leaves does not change `region_translate`, which is exactly why it is sound.)
-pub open spec fn region_set_encrypted(rm: RegionMap, start: VPage, enc: bool) -> RegionMap {
-    if rm.leaves.dom().contains(start) {
-        let e = rm.leaves[start];
-        RegionMap {
-            leaves: rm.leaves.insert(
-                start,
-                MapEntry { encrypted: enc, ..e },
-            ),
-        }
     } else {
-        rm
+        let e = mem.nodes[node].e[pt_index(vpn, level)];
+        if !e.present {
+            None
+        } else {
+            let acc2 = combine_step(arch, acc, e);
+            if level == 0 || e.leaf {
+                Some(
+                    Walk {
+                        frame: (e.target + vpn % span(level)) as nat,
+                        size: size_of_level(level),
+                        perm: acc2,
+                        enc: e.enc,
+                        global: e.global,
+                    },
+                )
+            } else {
+                walk_from(arch, mem, e.target, (level - 1) as nat, vpn, acc2)
+            }
+        }
     }
 }
 
-// =====================================================================
-// L2 - Region typing: PerCpu / Shared / PerTask / User / SelfMap
-// =====================================================================
-
-// Top-level (PML4 / level-3) indices, from `crate::address_space`.
-pub spec const PML4_PERTASK: nat = 508;
-pub spec const PML4_SELFMAP: nat = 493;
-pub spec const PML4_PERCPU: nat = 510;
-pub spec const PML4_SHARED: nat = 511;
-
-/// The PML4 index that owns a virtual page.
-pub open spec fn pml4_index(vp: VPage) -> nat {
-    (vp / PML4_SLOT_PAGES) % ENTRIES_PER_TABLE
+/// Translate `vpn` from page-table root frame `root` (i.e. CR3).
+pub open spec fn walk(arch: Arch, mem: PTMem, root: PFN, vpn: VPage) -> Option<Walk> {
+    walk_from(arch, mem, root, ROOT_LEVEL, vpn, perm_identity(arch))
 }
 
-/// Which kind of address-space region a virtual page falls in. This is the
-/// distinction that makes the three categories behave differently:
-///   * `Shared`   - one subtree shared by reference across every CR3;
-///   * `PerCpu`   - a distinct subtree per CPU;
-///   * `PerTask`  - kernel-side per-task subtree (idx 508);
-///   * `User`     - user-side per-task subtree (idx 0..=255);
-///   * `SelfMap`  - the recursive page-table self-map (idx 493);
-///   * `Unused`   - nothing should be mapped here.
+// --- structural well-formedness --------------------------------------
+
+/// The recursive self-map slot: the root's entry that points back to the root.
+pub open spec fn is_self_map(mem: PTMem, n: PFN, idx: nat) -> bool {
+    mem.level[n] == ROOT_LEVEL && idx == IDX_SELFMAP
+}
+
+pub open spec fn node_wf(mem: PTMem, n: PFN) -> bool {
+    forall|idx: nat| #![trigger mem.nodes[n].e[idx]]
+        (idx < ENTRIES && mem.nodes[n].e.dom().contains(idx) && mem.nodes[n].e[idx].present) ==> {
+            let e = mem.nodes[n].e[idx];
+            if e.leaf {
+                // Leaves only at levels 0..=2, and the base frame is aligned.
+                &&& mem.level.dom().contains(n)
+                &&& mem.level[n] <= 2
+                &&& e.target % span(mem.level[n]) == 0
+            } else {
+                // Interior links resolve one level down - except the self-map,
+                // which points back at the (same-level) root.
+                &&& mem.nodes.dom().contains(e.target)
+                &&& mem.level.dom().contains(n)
+                &&& mem.level.dom().contains(e.target)
+                &&& if is_self_map(mem, n, idx) {
+                    e.target == n
+                } else {
+                    mem.level[n] >= 1 && mem.level[e.target] == mem.level[n] - 1
+                }
+            }
+        }
+}
+
+/// Every node has its full 512 entries and obeys `node_wf`. Strictly decreasing
+/// interior levels (self-map aside) make the translation graph acyclic.
+pub open spec fn wf(mem: PTMem) -> bool {
+    forall|n: PFN| #[trigger]
+        mem.nodes.dom().contains(n) ==> (forall|i: nat| mem.nodes[n].e.dom().contains(i) <==> i
+            < ENTRIES) && node_wf(mem, n)
+}
+
+// --- entry-level updates (the abstract effect of pagetable.rs writes) ---
+
+pub open spec fn set_entry(mem: PTMem, n: PFN, idx: nat, e: Entry) -> PTMem {
+    PTMem { nodes: mem.nodes.insert(n, PTNode { e: mem.nodes[n].e.insert(idx, e) }), ..mem }
+}
+
+// --- the permissive-interior / leaf-only bridge ----------------------
+//
+// SVSM builds every interior entry PRESENT|WRITABLE|USER (NX clear) - see
+// `alloc_pte_lvl{1,2,3}`. Under x86, such permissive interiors do not restrict,
+// so the combined walk permission is decided by the leaf alone. The two
+// algebraic facts below are the heart of that argument.
+
+pub open spec fn permissive(e: Entry) -> bool {
+    e.present && e.w && e.user && !e.nx
+}
+
+/// A permissive interior entry leaves the x86 identity accumulator unchanged.
+pub proof fn lemma_permissive_keeps_top(e: Entry)
+    requires
+        permissive(e),
+    ensures
+        combine_step(Arch::X86, perm_identity(Arch::X86), e) == perm_identity(Arch::X86),
+{
+}
+
+/// With the identity accumulator, the leaf alone decides the permission.
+pub proof fn lemma_top_combine_is_leaf_only(e: Entry)
+    ensures
+        combine_step(Arch::X86, perm_identity(Arch::X86), e) == leaf_only_perm(e),
+{
+}
+
+// =====================================================================
+// (2) Permissions: a value-tracking PointsTo for a node
+// =====================================================================
+//
+// `PTEntry` and `VirtAddr` are defined in verus-neutralized vendored modules, so
+// the verifier sees them as opaque. Declare them as opaque datatypes so they may
+// appear in spec signatures.
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(missing_debug_implementations)]
+pub struct ExPTEntry(PTEntry);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(missing_debug_implementations)]
+pub struct ExVirtAddr(VirtAddr);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(missing_debug_implementations)]
+pub struct ExSvsmError(SvsmError);
+
+/// MMU translation relation: virtual address `va` denotes (the base of) physical
+/// node `pfn`. A node's `PageBox` VA and its self-map VA both satisfy this for
+/// the node's `pfn` - that is the aliasing fact.
+pub uninterp spec fn vaddr_maps_to(va: VirtAddr, pfn: PFN) -> bool;
+
+/// Decode a concrete `PTEntry`'s bits into the abstract `Entry`.
+pub uninterp spec fn pte_decode(e: PTEntry) -> Entry;
+
+/// Ownership permission for one page-table node. Like vstd's `PointsTo<V>`, it
+/// tracks both the access right and the node's VALUE (`value()`). Fields are
+/// private so the token cannot be forged outside this trusted module.
+#[allow(missing_debug_implementations)]
+pub tracked struct PointsToNode {
+    pfn_: PFN,
+    value_: PTNode,
+}
+
+impl PointsToNode {
+    /// Physical frame / identity of this node (its key in a `PTMem`).
+    pub closed spec fn pfn(self) -> PFN {
+        self.pfn_
+    }
+
+    /// The node's tracked contents - the bridge to the conceptual map.
+    pub closed spec fn value(self) -> PTNode {
+        self.value_
+    }
+
+    /// Well-formed: the content map has exactly the 512 entry indices.
+    pub closed spec fn wf(self) -> bool {
+        forall|i: nat| self.value_.e.dom().contains(i) <==> i < ENTRIES
+    }
+}
+
+/// A handle to a node: the virtual address used to access it (the `PointsTo`
+/// analog's pointer - it carries no ownership, only the address).
+#[allow(missing_debug_implementations)]
+pub struct NodePtr {
+    pub vaddr: VirtAddr,
+}
+
+/// View a set of held node permissions (plus the level bookkeeping the impl
+/// maintains) as the conceptual `PTMem`. This is the object the refinement proof
+/// relates the implementation's permission set to: `mem.nodes[p] == perms[p].value()`.
+pub open spec fn perms_view(perms: Map<PFN, PointsToNode>, level: Map<PFN, nat>) -> PTMem {
+    PTMem {
+        nodes: Map::new(|p: PFN| perms.dom().contains(p), |p: PFN| perms[p].value()),
+        level,
+    }
+}
+
+// --- trusted memory API (encapsulates ALL page-table `unsafe`) -------
+
+/// Read entry `idx`. Replaces `unsafe PTEntry::read_pte` / `from_vaddr` indexing.
+#[verifier::external_body]
+pub fn pte_read(p: &NodePtr, idx: usize, Tracked(perm): Tracked<&PointsToNode>) -> (r: PTEntry)
+    requires
+        perm.wf(),
+        vaddr_maps_to(p.vaddr, perm.pfn()),
+        idx < 512,
+    ensures
+        pte_decode(r) == perm.value().e[idx as nat],
+{
+    // SAFETY: `perm` witnesses ownership of the node at `p.vaddr`; `idx < 512`
+    // keeps the read in bounds.
+    let page: &PTPage = unsafe { &*p.vaddr.as_ptr::<PTPage>() };
+    page[idx]
+}
+
+/// Write entry `idx`. Replaces the `&mut`-aliased writes behind `PTEntry::set`/
+/// `clear` reached via `from_vaddr`. Tracks the new value precisely.
+#[verifier::external_body]
+pub fn pte_write(p: &NodePtr, idx: usize, e: PTEntry, Tracked(perm): Tracked<&mut PointsToNode>)
+    requires
+        old(perm).wf(),
+        vaddr_maps_to(p.vaddr, old(perm).pfn()),
+        idx < 512,
+    ensures
+        final(perm).wf(),
+        final(perm).pfn() == old(perm).pfn(),
+        final(perm).value() == (PTNode {
+            e: old(perm).value().e.insert(idx as nat, pte_decode(e)),
+        }),
+{
+    // SAFETY: the exclusive `perm` witnesses sole ownership of the node at
+    // `p.vaddr`; `idx < 512` keeps the write in bounds.
+    let page: &mut PTPage = unsafe { &mut *p.vaddr.as_mut_ptr::<PTPage>() };
+    page[idx] = e;
+}
+
+/// Allocate a fresh zeroed node, minting its ownership permission. Replaces
+/// `PTPage::alloc`. The new node is empty (no present entries).
+#[verifier::external_body]
+pub fn node_alloc() -> (r: Result<(NodePtr, Tracked<PointsToNode>), SvsmError>)
+    ensures
+        r matches Ok((ptr, perm)) ==> {
+            &&& perm@.wf()
+            &&& vaddr_maps_to(ptr.vaddr, perm@.pfn())
+            &&& forall|i: nat| i < 512 ==> !(#[trigger] perm@.value().e[i]).present
+        },
+{
+    let pb: PageBox<PTPage> = PageBox::try_new_zeroed()?;
+    let vaddr = pb.vaddr();
+    let _leaked: &'static mut PTPage = PageBox::leak(pb);
+    Ok((NodePtr { vaddr }, Tracked::assume_new()))
+}
+
+/// Free a node, consuming its permission. Replaces `unsafe PTPage::free`. Sound
+/// only with the (exclusive) permission in hand.
+#[verifier::external_body]
+pub fn node_free(p: NodePtr, Tracked(perm): Tracked<PointsToNode>)
+    requires
+        vaddr_maps_to(p.vaddr, perm.pfn()),
+{
+    // SAFETY: consuming `perm` proves no other reference exists; the handle came
+    // from `node_alloc`, so this frees exactly that allocation.
+    let ptr = p.vaddr.as_mut_ptr::<PTPage>();
+    let nn = unsafe { NonNull::new_unchecked(ptr) };
+    let _ = unsafe { PageBox::from_raw(nn) };
+}
+
+/// Connect the permission set to the conceptual map: a held node's value is
+/// exactly its `PTMem` content.
+pub proof fn lemma_perms_view_node(perms: Map<PFN, PointsToNode>, level: Map<PFN, nat>, p: PFN)
+    requires
+        perms.dom().contains(p),
+    ensures
+        perms_view(perms, level).nodes.dom().contains(p),
+        perms_view(perms, level).nodes[p] == perms[p].value(),
+{
+}
+
+// =====================================================================
+// (3) Properties
+// =====================================================================
+
+// --- region typing ---------------------------------------------------
+
 #[derive(PartialEq, Eq, Structural, Debug)]
 pub enum RegionKind {
     User,
@@ -208,213 +492,120 @@ pub enum RegionKind {
     Unused,
 }
 
-pub open spec fn region_of(vp: VPage) -> RegionKind {
-    let idx = pml4_index(vp);
+/// Which region a page falls in, from its top-level (PML4) index.
+pub open spec fn region_of(vpn: VPage) -> RegionKind {
+    let idx = pt_index(vpn, ROOT_LEVEL);
     if idx <= 255 {
         RegionKind::User
-    } else if idx == PML4_PERTASK {
+    } else if idx == IDX_PERTASK {
         RegionKind::PerTask
-    } else if idx == PML4_SELFMAP {
+    } else if idx == IDX_SELFMAP {
         RegionKind::SelfMap
-    } else if idx == PML4_PERCPU {
+    } else if idx == IDX_PERCPU {
         RegionKind::PerCpu
-    } else if idx == PML4_SHARED {
+    } else if idx == IDX_SHARED {
         RegionKind::Shared
     } else {
         RegionKind::Unused
     }
 }
 
-/// The attribute profile each region is allowed to expose. This is where the
-/// per-region policy differences live.
-pub open spec fn region_attr_wf(kind: RegionKind, e: MapEntry) -> bool {
+/// The attribute policy each region's translations must satisfy. This is where
+/// User / PerTask / PerCpu / Shared genuinely differ.
+pub open spec fn region_walk_ok(kind: RegionKind, w: Walk) -> bool {
     match kind {
-        // User mappings are user-accessible and never global (flushed on CR3
-        // switch) and back private task memory.
-        RegionKind::User => e.user && !e.global && e.encrypted,
-        // Per-task kernel mappings: supervisor, global, private.
-        RegionKind::PerTask => !e.user && e.global && e.encrypted,
-        // Per-CPU mappings: supervisor, global. (encryption varies: e.g. guest
-        // VMSA/CAA windows may be shared, so it is not constrained here.)
-        RegionKind::PerCpu => !e.user && e.global,
-        // Shared kernel image / heap / global maps: supervisor, global.
-        RegionKind::Shared => !e.user && e.global,
-        // Self-map points at page-table pages: never executable, private.
-        RegionKind::SelfMap => !e.x && e.encrypted,
-        // Nothing may be mapped in unused regions.
+        RegionKind::User => w.perm.user && !w.global && w.enc,
+        RegionKind::PerTask => !w.perm.user && w.global && w.enc,
+        RegionKind::PerCpu => !w.perm.user && w.global,
+        RegionKind::Shared => !w.perm.user && w.global,
+        RegionKind::SelfMap => !w.perm.x && w.enc,
         RegionKind::Unused => false,
     }
 }
 
-// =====================================================================
-// L3 - System: CPU fleet, per-CPU TLBs, flush modes, confidentiality
-// =====================================================================
-
-/// A per-CPU TLB: a cache of translations the CPU may still use even after the
-/// backing page table has changed. Modeled as the set of cached leaves keyed by
-/// the accessed virtual page.
-#[allow(missing_debug_implementations)]
-pub struct Tlb {
-    pub cached: Map<VPage, MapEntry>,
-}
-
-/// The whole-system address-space state.
-///
-/// The shared subtree is a *single* object (idx 511, shared by reference); the
-/// per-CPU and per-task subtrees are indexed families. `running[cpu]` records
-/// which task's subtree is mounted under that CPU's CR3.
-#[allow(missing_debug_implementations)]
-pub struct System {
-    pub shared: RegionMap,
-    pub percpu: Map<CpuId, RegionMap>,
-    pub pertask: Map<TaskId, RegionMap>,
-    pub running: Map<CpuId, TaskId>,
-    pub tlb: Map<CpuId, Tlb>,
-}
-
-/// The translation a CPU's *page table* currently encodes for `vp`: pick the
-/// subtree by region, composing shared (by reference) + this CPU's per-CPU
-/// subtree + the running task's per-task/user subtree.
-pub open spec fn pagetable_view(sys: System, cpu: CpuId, vp: VPage) -> Option<(PFN, MapEntry)> {
-    match region_of(vp) {
-        RegionKind::Shared => region_translate(sys.shared, vp),
-        RegionKind::PerCpu => region_translate(sys.percpu[cpu], vp),
-        RegionKind::PerTask => region_translate(sys.pertask[sys.running[cpu]], vp),
-        RegionKind::User => region_translate(sys.pertask[sys.running[cpu]], vp),
-        // The self-map is the page table observing itself; left opaque here.
-        RegionKind::SelfMap => None,
-        RegionKind::Unused => None,
-    }
-}
-
-/// The translation a CPU *actually* uses: a stale TLB entry takes priority over
-/// the page table (the architectural reality that motivates flushing).
-pub open spec fn effective(sys: System, cpu: CpuId, vp: VPage) -> Option<MapEntry> {
-    if sys.tlb[cpu].cached.dom().contains(vp) {
-        Some(sys.tlb[cpu].cached[vp])
-    } else {
-        match pagetable_view(sys, cpu, vp) {
-            Some((_f, e)) => Some(e),
-            None => None,
-        }
-    }
-}
-
-// --- The four TLB flush modes (cpu/tlb.rs) ----------------------------------
-
-/// `INVLPG`: drop a single virtual page from one CPU's TLB.
-pub open spec fn tlb_flush_addr(t: Tlb, vp: VPage) -> Tlb {
-    Tlb { cached: t.cached.remove(vp) }
-}
-
-/// CR3 reload (non-global flush): drop all *non-global* entries; globals stay.
-pub open spec fn tlb_flush_nonglobal(t: Tlb) -> Tlb {
-    Tlb { cached: t.cached.restrict(Set::new(|vp: VPage| t.cached[vp].global)) }
-}
-
-/// PGE toggle (local global flush): drop *all* entries, including globals.
-pub open spec fn tlb_flush_all(t: Tlb) -> Tlb {
-    Tlb { cached: Map::empty() }
-}
-
-/// Global-sync broadcast: a full flush applied to *every* CPU's TLB. Models the
-/// IPI broadcast that blocks until all CPUs have acknowledged.
-pub open spec fn sys_flush_global_sync(sys: System) -> System {
-    System {
-        tlb: Map::new(|c: CpuId| sys.tlb.dom().contains(c), |c: CpuId| tlb_flush_all(sys.tlb[c])),
-        ..sys
-    }
-}
-
-/// Context switch: mount a different task under `cpu`'s CR3. The CR3 reload
-/// flushes that CPU's non-global TLB entries (user/task mappings).
-pub open spec fn sys_context_switch(sys: System, cpu: CpuId, task: TaskId) -> System {
-    System {
-        running: sys.running.insert(cpu, task),
-        tlb: sys.tlb.insert(cpu, tlb_flush_nonglobal(sys.tlb[cpu])),
-        ..sys
-    }
-}
-
-// --- System well-formedness + the top-level confidentiality property --------
-
-/// Structural well-formedness: every mounted subtree is well-formed and obeys
-/// its region's attribute policy.
-pub open spec fn region_map_typed(rm: RegionMap, kind: RegionKind) -> bool {
-    forall|k: VPage| #[trigger]
-        rm.leaves.dom().contains(k) ==> region_attr_wf(kind, rm.leaves[k])
-}
-
-pub open spec fn system_wf(sys: System) -> bool {
-    &&& region_wf(sys.shared)
-    &&& region_map_typed(sys.shared, RegionKind::Shared)
-    &&& forall|c: CpuId| #[trigger]
-        sys.percpu.dom().contains(c) ==> region_wf(sys.percpu[c]) && region_map_typed(
-            sys.percpu[c],
-            RegionKind::PerCpu,
+/// Every translation respects its region's policy.
+pub open spec fn region_typed(arch: Arch, mem: PTMem, root: PFN) -> bool {
+    forall|vpn: VPage| #![trigger walk(arch, mem, root, vpn)]
+        walk(arch, mem, root, vpn) is Some ==> region_walk_ok(
+            region_of(vpn),
+            walk(arch, mem, root, vpn)->Some_0,
         )
-    &&& forall|t: TaskId| #[trigger]
-        sys.pertask.dom().contains(t) ==> region_wf(sys.pertask[t])
 }
 
-/// Confidentiality goal (the property worth proving about the kernel):
-/// no two effective translations anywhere in the fleet disagree about whether a
-/// frame is private or shared. In particular a frame revealed to the host as
-/// shared can never be simultaneously reachable as private by any CPU - through
-/// the page table *or* a stale TLB entry.
-pub open spec fn no_conflicting_confidentiality(sys: System) -> bool {
-    forall|c1: CpuId, vp1: VPage, c2: CpuId, vp2: VPage|
-        #![trigger effective(sys, c1, vp1), effective(sys, c2, vp2)]
-        ({
-            let e1 = effective(sys, c1, vp1);
-            let e2 = effective(sys, c2, vp2);
-            &&& e1 is Some
-            &&& e2 is Some
-            &&& e1->Some_0.frame == e2->Some_0.frame
-        }) ==> effective(sys, c1, vp1)->Some_0.encrypted == effective(
-            sys,
-            c2,
-            vp2,
-        )->Some_0.encrypted
+// --- the A/D ownership discipline ------------------------------------
+//
+// Structural bits are software-exclusive. A/D are co-owned with the MMU and
+// monotone: any reachable walker may raise them; software lowers them only with
+// exclusive (post-flush) ownership. SVSM sidesteps this by PINNING A/D at publish
+// time, so the MMU's writes become no-ops and `&mut PageTable` is sound again.
+
+pub open spec fn entry_pinned(e: Entry) -> bool {
+    e.present ==> (e.accessed && (e.w ==> e.dirty))
 }
 
-// =====================================================================
-// Sanity lemmas (exercise the model; not the real refinement proofs)
-// =====================================================================
-
-/// Leaf sizes are positive (needed pervasively by `covers`/`entry_wf`).
-pub proof fn lemma_pagesz_pages_pos(s: PageSz)
-    ensures
-        s.pages() > 0,
-{
+pub open spec fn ad_pinned(mem: PTMem) -> bool {
+    forall|n: PFN, i: nat| #![trigger mem.nodes[n].e[i]]
+        (mem.nodes.dom().contains(n) && i < ENTRIES && mem.nodes[n].e.dom().contains(i))
+            ==> entry_pinned(mem.nodes[n].e[i])
 }
 
-/// After a full local flush, the CPU's effective translation collapses to its
-/// page-table view (no entry can be served from the emptied TLB).
-pub proof fn lemma_flush_all_collapses_to_pagetable(sys: System, cpu: CpuId, vp: VPage)
+/// The MMU raising the ACCESSED bit on entry `(n, idx)`.
+pub open spec fn hw_set_accessed(mem: PTMem, n: PFN, idx: nat) -> PTMem {
+    set_entry(mem, n, idx, Entry { accessed: true, ..mem.nodes[n].e[idx] })
+}
+
+/// Inserting a key's current value is a no-op (helper).
+pub proof fn lemma_insert_same<K, V>(m: Map<K, V>, k: K)
     requires
-        sys.tlb.dom().contains(cpu),
+        m.dom().contains(k),
     ensures
-        ({
-            let sys2 = System { tlb: sys.tlb.insert(cpu, tlb_flush_all(sys.tlb[cpu])), ..sys };
-            effective(sys2, cpu, vp) == match pagetable_view(sys2, cpu, vp) {
-                Some((_f, e)) => Some(e),
-                None => None::<MapEntry>,
-            }
-        }),
+        m.insert(k, m[k]) == m,
 {
-    let sys2 = System { tlb: sys.tlb.insert(cpu, tlb_flush_all(sys.tlb[cpu])), ..sys };
-    assert(sys2.tlb[cpu].cached =~= Map::<VPage, MapEntry>::empty());
-    assert(!sys2.tlb[cpu].cached.dom().contains(vp));
+    assert(m.insert(k, m[k]) =~= m);
 }
 
-/// A global-sync broadcast empties every CPU's TLB.
-pub proof fn lemma_global_sync_empties_all(sys: System, cpu: CpuId)
+/// THE `&mut PageTable` JUSTIFICATION. Under the pinned-A/D invariant the MMU's
+/// only permitted write (raise ACCESSED) leaves the memory unchanged, so the sole
+/// concurrent writer is neutralized and exclusive reasoning is sound.
+pub proof fn lemma_ad_pin_accessed_noop(mem: PTMem, n: PFN, idx: nat)
     requires
-        sys.tlb.dom().contains(cpu),
+        ad_pinned(mem),
+        mem.nodes.dom().contains(n),
+        mem.nodes[n].e.dom().contains(idx),
+        idx < ENTRIES,
+        mem.nodes[n].e[idx].present,
     ensures
-        sys_flush_global_sync(sys).tlb[cpu].cached =~= Map::<VPage, MapEntry>::empty(),
+        hw_set_accessed(mem, n, idx) == mem,
 {
+    let node = mem.nodes[n];
+    let e = node.e[idx];
+    assert(entry_pinned(e));
+    assert(e.accessed);
+    let e2 = Entry { accessed: true, ..e };
+    assert(e2 == e);
+    lemma_insert_same(node.e, idx);
+    assert(node.e.insert(idx, e2) == node.e);
+    assert(PTNode { e: node.e.insert(idx, e2) } == node);
+    lemma_insert_same(mem.nodes, n);
+}
+
+// --- confidentiality goal --------------------------------------------
+
+/// Frames covered by a translation.
+pub open spec fn walk_frames(w: Walk) -> Set<PFN> {
+    Set::new(|f: PFN| w.frame <= f < w.frame + w.size.pages())
+}
+
+/// Top-level confidentiality property: every translation reads a page as
+/// host-shared (`enc == false`) iff its frames are in the software's
+/// `host_shared` set. (Multi-CPU + stale-TLB reasoning is a higher system layer
+/// built on `walk`; this states the per-page-table invariant it relies on.)
+pub open spec fn confidential(arch: Arch, mem: PTMem, root: PFN, host_shared: Set<PFN>) -> bool {
+    forall|vpn: VPage| #![trigger walk(arch, mem, root, vpn)]
+        walk(arch, mem, root, vpn) is Some ==> {
+            let w = walk(arch, mem, root, vpn)->Some_0;
+            (!w.enc) <==> walk_frames(w).subset_of(host_shared)
+        }
 }
 
 } // verus!
