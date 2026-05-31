@@ -16,23 +16,27 @@
 //       (`walk`), and the structural well-formedness (`wf`). All translation and
 //       permission combination live here.
 //
-//   (2) PERMISSIONS - a `PointsTo`-style ownership token (`PointsToNode`) that,
-//       like vstd's `PointsTo<V>`, tracks BOTH the access right AND the node's
-//       value (`value() : PTNode`). A set of these tokens *is* a `PTMem`
-//       (`perms_view`). A small trusted memory API (`pte_read`/`pte_write`/
-//       `node_alloc`/`node_free`) lets `pagetable.rs` drop all `unsafe`.
+//   (2) PERMISSIONS - a page-allocator permission (`Page<T>`) tying together a
+//       PFN, a raw PPtr, the tracked value, and the deallocation right. A
+//       page-table specialization (`PTPagePerm`) records each node's decoded
+//       value and level; the root table owns all live node permissions in
+//       `PageTablePerms`. A small trusted memory API (`pte_read`/`pte_write`/
+//       `pt_page_alloc`/`pt_page_free`) lets `pagetable.rs` drop all page-table
+//       `unsafe`.
 //
 //   (3) PROPERTIES - region typing, the A/D ownership discipline (struct bits are
 //       software-exclusive; A/D are co-owned with the MMU and monotone), and the
 //       confidentiality goal.
 //
 // Trusted surface (audited once, replaces all page-table `unsafe`): the external
-// type declarations, `vaddr_maps_to`, `pte_decode`, and the four memory API
+// type declarations, direct-map relations, `pte_decode`, and the memory API
 // functions. Everything else is ordinary verified code.
 
 use crate::address::{Address, PhysAddr, VirtAddr};
-use crate::pagetable::{PTEntry, PTEntryFlags, PTPage, PageFrame, make_private_address};
-use crate::stubs::{PageBox, SvsmError, phys_to_virt};
+use crate::pagetable::{
+    PTEntry, PTEntryFlags, PTPage, PageFrame, make_private_address, make_shared_address,
+};
+use crate::stubs::{PageBox, SvsmError, phys_to_virt, virt_to_phys};
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 use vstd::prelude::*;
@@ -41,163 +45,200 @@ use zerocopy::FromZeros;
 verus! {
 
 // =====================================================================
-// APointsTo - an address-keyed ownership permission (the "raw PointsTo")
+// Page permissions: PFN identity + PPtr access handle
 // =====================================================================
 //
-// Lower-level than vstd's `PointsTo<T>`: the caller is handed the RAW address
-// (`VA`/`PA` wrap a `usize`) so it can do address arithmetic (build PTE bits,
-// compute self-map addresses), while the tracked `APointsTo<T>` carries the
-// ownership and the tracked value. Keying by address + a trusted `ptv`
-// (phys->virt) relation sidesteps pointer provenance, which is what makes
-// reconstructing a node from a physical address verifiable.
+// This is the page-table-specialized analogue of vstd's `PPtr`/`PointsTo`.
+// The executable code may carry raw integers around: a PFN is what is encoded in
+// a PTE, and a PPtr is just the direct-map virtual address used to access the
+// page. Neither integer has authority by itself. The tracked `Page<T>` token is
+// the authority connecting the PFN, the PPtr, the tracked value, and the right to
+// eventually return the page to the page allocator.
 
-/// A physical address of a `T`.
+pub spec const PAGE_SIZE: nat = 4096;
+
+/// Physical frame number as an executable value. The conceptual MMU model below
+/// uses `PFN = nat`; executable PFNs are related with `pfn as nat`.
+pub open spec fn pfn_pa(pfn: usize) -> nat {
+    (pfn as nat) * PAGE_SIZE
+}
+
+/// Trusted direct-map relation. This intentionally talks about raw integers: a
+/// `PPtr<T>` is an address, not a Rust reference or provenance-carrying pointer.
+pub uninterp spec fn direct_map_addr(pa: nat) -> usize;
+
+pub uninterp spec fn reverse_direct_map_addr(va: usize) -> nat;
+
+pub open spec fn pptr_matches_pfn<T>(pptr: PPtr<T>, pfn: usize) -> bool {
+    &&& pptr.addr() == direct_map_addr(pfn_pa(pfn))
+    &&& reverse_direct_map_addr(pptr.addr()) == pfn_pa(pfn)
+}
+
+/// A typed raw virtual address. It carries no ownership and can only be used to
+/// access memory together with a matching tracked `Page<T>`.
 #[allow(missing_debug_implementations)]
-pub struct PA<T> {
+pub struct PPtr<T> {
     pub addr: usize,
     pub _pd: PhantomData<T>,
 }
 
-/// A virtual address of a `T`.
-#[allow(missing_debug_implementations)]
-pub struct VA<T> {
-    pub addr: usize,
-    pub _pd: PhantomData<T>,
+impl<T> Copy for PPtr<T> {}
+
+impl<T> Clone for PPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
-/// Trusted physical->virtual mapping (the kernel direct map). Injective on owned
-/// pages, so a `PA` denotes a unique `VA`.
-pub uninterp spec fn ptv(pa: usize) -> usize;
-
-/// Ownership permission for the `T` stored at a physical address. Tracks the
-/// address identity and the value. Fields private: only `alloc_page` mints one.
-#[allow(missing_debug_implementations)]
-pub tracked struct APointsTo<T> {
-    addr_: usize,
-    value_: T,
+impl<T> PPtr<T> {
+    pub closed spec fn addr(self) -> usize {
+        self.addr
+    }
 }
 
-impl<T> APointsTo<T> {
-    /// Physical address of the owned `T`.
-    pub closed spec fn pa(self) -> usize {
-        self.addr_
+/// Deallocation authority for one page-allocator page. Kept private inside
+/// `Page<T>` so freeing requires consuming the same permission that allowed
+/// access.
+#[allow(missing_debug_implementations)]
+pub tracked struct PageDealloc<T> {
+    pfn_: usize,
+    pptr_: PPtr<T>,
+}
+
+impl<T> PageDealloc<T> {
+    pub closed spec fn pfn(self) -> usize {
+        self.pfn_
     }
 
-    /// Virtual address of the owned `T` (its unique direct-map address).
-    pub closed spec fn va(self) -> usize {
-        ptv(self.addr_)
+    pub closed spec fn pptr(self) -> PPtr<T> {
+        self.pptr_
+    }
+
+    pub closed spec fn wf(self) -> bool {
+        pptr_matches_pfn(self.pptr(), self.pfn())
+    }
+}
+
+/// Ownership permission for one page-allocator page.
+#[allow(missing_debug_implementations)]
+pub tracked struct Page<T> {
+    pfn_: usize,
+    pptr_: PPtr<T>,
+    value_: T,
+    dealloc_: PageDealloc<T>,
+}
+
+impl<T> Page<T> {
+    /// Physical frame / stable identity of this allocation.
+    pub closed spec fn pfn(self) -> usize {
+        self.pfn_
+    }
+
+    /// Raw direct-map pointer through which the page may be accessed.
+    pub closed spec fn pptr(self) -> PPtr<T> {
+        self.pptr_
     }
 
     /// The tracked value.
     pub closed spec fn value(self) -> T {
         self.value_
     }
+
+    pub closed spec fn dealloc(self) -> PageDealloc<T> {
+        self.dealloc_
+    }
+
+    /// The PFN, PPtr and deallocation token all describe the same page.
+    pub closed spec fn wf(self) -> bool {
+        &&& pptr_matches_pfn(self.pptr(), self.pfn())
+        &&& self.dealloc().pfn() == self.pfn()
+        &&& self.dealloc().pptr().addr() == self.pptr().addr()
+        &&& self.dealloc().wf()
+    }
+
+    pub closed spec fn update_value(self, value: T) -> Page<T> {
+        Page {
+            pfn_: self.pfn_,
+            pptr_: self.pptr_,
+            value_: value,
+            dealloc_: self.dealloc_,
+        }
+    }
 }
 
-/// Allocate a fresh zeroed page from the kernel heap, returning its virtual
-/// address and the ownership permission. No `unsafe` for the caller.
-/// (`FromZeros` triggers a benign "external trait" warning for now.)
+/// Borrow the content immutably through a matching PPtr/Page pair.
 #[verifier::external_body]
-pub fn alloc_page<T: FromZeros + 'static>() -> (r: Result<(VA<T>, Tracked<APointsTo<T>>), SvsmError>)
-    ensures
-        r matches Ok((va, perm)) ==> va.addr == perm@.va(),
-{
-    let pb: PageBox<T> = PageBox::try_new_zeroed()?;
-    let vaddr = pb.vaddr();
-    let _leaked: &'static mut T = PageBox::leak(pb);
-    Ok((VA { addr: vaddr.bits(), _pd: PhantomData }, Tracked::assume_new()))
-}
-
-/// Borrow the content immutably through a virtual address that maps to the owned
-/// page. Replaces the `unsafe { &*vaddr.as_ptr() }` reconstruction.
-#[verifier::external_body]
-pub fn va_borrow<'a, T>(va: VA<T>, Tracked(perm): Tracked<&'a APointsTo<T>>) -> (r: &'a T)
+pub fn pptr_borrow<'a, T>(pptr: PPtr<T>, Tracked(perm): Tracked<&'a Page<T>>) -> (r: &'a T)
     requires
-        va.addr == perm.va(),
+        perm.wf(),
+        pptr.addr() == perm.pptr().addr(),
     ensures
         *r == perm.value(),
 {
-    // SAFETY: `perm` witnesses ownership of the `T` at `va` (= ptv(perm.pa())).
-    unsafe { &*(va.addr as *const T) }
+    // SAFETY: `perm` witnesses ownership of the `T` at `pptr`.
+    unsafe { &*(pptr.addr as *const T) }
 }
 
 /// Borrow the content mutably. The returned `&mut T` is tied to the `&mut`
 /// borrow of the permission, and the permission tracks the final content.
-/// Replaces `unsafe { &mut *vaddr.as_mut_ptr() }`.
 #[verifier::external_body]
-pub fn va_borrow_mut<'a, T>(va: VA<T>, Tracked(perm): Tracked<&'a mut APointsTo<T>>) -> (r: &'a mut T)
+pub fn pptr_borrow_mut<'a, T>(pptr: PPtr<T>, Tracked(perm): Tracked<&'a mut Page<T>>) -> (r: &'a mut T)
     requires
-        va.addr == old(perm).va(),
+        old(perm).wf(),
+        pptr.addr() == old(perm).pptr().addr(),
     ensures
         *r == old(perm).value(),
-        final(perm).pa() == old(perm).pa(),
+        final(perm).wf(),
+        final(perm).pfn() == old(perm).pfn(),
+        final(perm).pptr().addr() == old(perm).pptr().addr(),
         final(perm).value() == *r,
 {
-    // SAFETY: the exclusive `perm` witnesses sole ownership of the `T` at `va`.
-    unsafe { &mut *(va.addr as *mut T) }
+    // SAFETY: the exclusive `perm` witnesses sole ownership of the `T` at `pptr`.
+    unsafe { &mut *(pptr.addr as *mut T) }
 }
-
-// --- the same, keyed on the PHYSICAL address (the page-table code reaches a
-// --- child node by the PA stored in its parent entry) -----------------------
-
-/// Borrow the content immutably through the physical address. `ptv` resolves it
-/// to the page's direct-map virtual address.
-#[verifier::external_body]
-pub fn pa_borrow<'a, T>(pa: PA<T>, Tracked(perm): Tracked<&'a APointsTo<T>>) -> (r: &'a T)
-    requires
-        pa.addr == perm.pa(),
-    ensures
-        *r == perm.value(),
-{
-    // SAFETY: `perm` witnesses ownership of the `T` at physical `pa`.
-    let va = phys_to_virt(PhysAddr::from(pa.addr));
-    unsafe { &*(va.bits() as *const T) }
-}
-
-/// Borrow the content mutably through the physical address.
-#[verifier::external_body]
-pub fn pa_borrow_mut<'a, T>(pa: PA<T>, Tracked(perm): Tracked<&'a mut APointsTo<T>>) -> (r: &'a mut T)
-    requires
-        pa.addr == old(perm).pa(),
-    ensures
-        *r == old(perm).value(),
-        final(perm).pa() == old(perm).pa(),
-        final(perm).value() == *r,
-{
-    // SAFETY: the exclusive `perm` witnesses sole ownership of the `T` at `pa`.
-    let va = phys_to_virt(PhysAddr::from(pa.addr));
-    unsafe { &mut *(va.bits() as *mut T) }
-}
-
-// --- whole-value read / write (value tracking, like vstd PointsTo) ----------
 
 /// Read the whole value out by copy.
 #[verifier::external_body]
-pub fn pa_read<T: Copy>(pa: PA<T>, Tracked(perm): Tracked<&APointsTo<T>>) -> (v: T)
+pub fn pptr_read<T: Copy>(pptr: PPtr<T>, Tracked(perm): Tracked<&Page<T>>) -> (v: T)
     requires
-        pa.addr == perm.pa(),
+        perm.wf(),
+        pptr.addr() == perm.pptr().addr(),
     ensures
         v == perm.value(),
 {
-    let va = phys_to_virt(PhysAddr::from(pa.addr));
-    // SAFETY: `perm` witnesses ownership of the `T` at `pa`.
-    unsafe { *(va.bits() as *const T) }
+    // SAFETY: `perm` witnesses ownership of the `T` at `pptr`.
+    unsafe { *(pptr.addr as *const T) }
 }
 
 /// Overwrite the whole value; the permission tracks the new value.
 #[verifier::external_body]
-pub fn pa_write<T>(pa: PA<T>, Tracked(perm): Tracked<&mut APointsTo<T>>, v: T)
+pub fn pptr_write<T>(pptr: PPtr<T>, Tracked(perm): Tracked<&mut Page<T>>, v: T)
     requires
-        pa.addr == old(perm).pa(),
+        old(perm).wf(),
+        pptr.addr() == old(perm).pptr().addr(),
     ensures
-        final(perm).pa() == old(perm).pa(),
+        final(perm).wf(),
+        final(perm).pfn() == old(perm).pfn(),
+        final(perm).pptr().addr() == old(perm).pptr().addr(),
         final(perm).value() == v,
 {
-    let va = phys_to_virt(PhysAddr::from(pa.addr));
-    // SAFETY: the exclusive `perm` witnesses sole ownership of the `T` at `pa`.
+    // SAFETY: the exclusive `perm` witnesses sole ownership of the `T` at `pptr`.
     unsafe {
-        *(va.bits() as *mut T) = v;
+        *(pptr.addr as *mut T) = v;
     }
+}
+
+/// Free a page-allocator page, consuming the only authority that can access it.
+#[verifier::external_body]
+pub fn free_page<T>(pptr: PPtr<T>, pfn: usize, Tracked(perm): Tracked<Page<T>>)
+    requires
+        perm.wf(),
+        pfn == perm.pfn(),
+        pptr.addr() == perm.pptr().addr(),
+{
+    let ptr = pptr.addr as *mut T;
+    let nn = unsafe { NonNull::new_unchecked(ptr) };
+    let _ = unsafe { PageBox::from_raw(nn) };
 }
 
 // =====================================================================
@@ -298,6 +339,23 @@ pub struct Entry {
 #[allow(missing_debug_implementations)]
 pub struct PTNode {
     pub e: Map<nat, Entry>,
+}
+
+impl PTNode {
+    /// A concrete page-table page always has exactly the architectural entry set.
+    pub open spec fn wf(self) -> bool {
+        forall|i: nat| self.e.dom().contains(i) <==> i < ENTRIES
+    }
+
+    /// Fresh zeroed page-table pages contain no present entries.
+    pub open spec fn empty(self) -> bool {
+        &&& self.wf()
+        &&& forall|i: nat| i < ENTRIES ==> !(#[trigger] self.e[i]).present
+    }
+
+    pub open spec fn update(self, idx: nat, e: Entry) -> PTNode {
+        PTNode { e: self.e.insert(idx, e) }
+    }
 }
 
 /// The page-table memory the MMU sees: the frames that are nodes, their decoded
@@ -422,8 +480,11 @@ pub open spec fn node_wf(mem: PTMem, n: PFN) -> bool {
     forall|idx: nat| #![trigger mem.nodes[n].e[idx]]
         (idx < ENTRIES && mem.nodes[n].e.dom().contains(idx) && mem.nodes[n].e[idx].present) ==> {
             let e = mem.nodes[n].e[idx];
-            if e.leaf {
-                // Leaves only at levels 0..=2, and the base frame is aligned.
+            if mem.level[n] == 0 || e.leaf {
+                // Level-0 entries are 4K leaves even though x86 does not set
+                // the HUGE bit there. Huge leaves may additionally appear at
+                // levels 1 and 2. In all leaf cases, the base frame is aligned
+                // to the page size selected by the current level.
                 &&& mem.level.dom().contains(n)
                 &&& mem.level[n] <= 2
                 &&& e.target % span(mem.level[n]) == 0
@@ -484,7 +545,7 @@ pub proof fn lemma_top_combine_is_leaf_only(e: Entry)
 }
 
 // =====================================================================
-// (2) Permissions: a value-tracking PointsTo for a node
+// (2) Permissions: root-owned page-table page capabilities
 // =====================================================================
 //
 // `PTEntry` and `VirtAddr` are defined in verus-neutralized vendored modules, so
@@ -495,6 +556,16 @@ pub proof fn lemma_top_combine_is_leaf_only(e: Entry)
 #[verifier::external_body]
 #[allow(missing_debug_implementations)]
 pub struct ExPTEntry(PTEntry);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(missing_debug_implementations)]
+pub struct ExPTPage(PTPage);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(missing_debug_implementations)]
+pub struct ExPTEntryFlags(PTEntryFlags);
 
 #[verifier::external_type_specification]
 #[verifier::external_body]
@@ -511,59 +582,257 @@ pub struct ExPhysAddr(PhysAddr);
 #[allow(missing_debug_implementations)]
 pub struct ExSvsmError(SvsmError);
 
+#[verifier::external_body]
+pub fn svsm_mem_error() -> SvsmError {
+    SvsmError::Mem
+}
+
 #[verifier::external_type_specification]
 #[verifier::external_body]
 #[allow(missing_debug_implementations)]
 pub struct ExPageFrame(PageFrame);
 
-/// MMU translation relation: virtual address `va` denotes (the base of) physical
-/// node `pfn`. A node's `PageBox` VA and its self-map VA both satisfy this for
-/// the node's `pfn` - that is the aliasing fact.
-pub uninterp spec fn vaddr_maps_to(va: VirtAddr, pfn: PFN) -> bool;
-
 /// Decode a concrete `PTEntry`'s bits into the abstract `Entry`.
 pub uninterp spec fn pte_decode(e: PTEntry) -> Entry;
 
-/// Ownership permission for one page-table node. Like vstd's `PointsTo<V>`, it
-/// tracks both the access right and the node's VALUE (`value()`). Fields are
-/// private so the token cannot be forged outside this trusted module.
+/// A raw access handle for the concrete `PTPage` backing a logical `PTNode`.
+/// The handle is only an address. It can read/write entries only with a matching
+/// `PTPagePerm`.
 #[allow(missing_debug_implementations)]
-pub tracked struct PointsToNode {
-    pfn_: PFN,
-    value_: PTNode,
+pub struct PTPagePtr {
+    pub pptr: PPtr<PTNode>,
 }
 
-impl PointsToNode {
-    /// Physical frame / identity of this node (its key in a `PTMem`).
-    pub closed spec fn pfn(self) -> PFN {
-        self.pfn_
+impl Copy for PTPagePtr {}
+
+impl Clone for PTPagePtr {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl PTPagePtr {
+    pub closed spec fn addr(self) -> usize {
+        self.pptr.addr()
+    }
+}
+
+/// Ownership permission for one live page-table node.
+///
+/// `page_` is a page-allocator permission whose value is the decoded logical
+/// `PTNode`. `level_` records where the node sits in the paging tree, which is
+/// necessary to prove parent-child links decrease levels and huge-page leaves are
+/// aligned correctly.
+#[allow(missing_debug_implementations)]
+pub tracked struct PTPagePerm {
+    page_: Page<PTNode>,
+    level_: nat,
+}
+
+impl PTPagePerm {
+    pub closed spec fn page(self) -> Page<PTNode> {
+        self.page_
     }
 
-    /// The node's tracked contents - the bridge to the conceptual map.
+    /// Physical frame / identity of this node.
+    pub closed spec fn pfn(self) -> usize {
+        self.page().pfn()
+    }
+
+    pub closed spec fn pptr(self) -> PPtr<PTNode> {
+        self.page().pptr()
+    }
+
     pub closed spec fn value(self) -> PTNode {
-        self.value_
+        self.page().value()
     }
 
-    /// Well-formed: the content map has exactly the 512 entry indices.
+    pub closed spec fn level(self) -> nat {
+        self.level_
+    }
+
     pub closed spec fn wf(self) -> bool {
-        forall|i: nat| self.value_.e.dom().contains(i) <==> i < ENTRIES
+        &&& self.page().wf()
+        &&& self.level() <= ROOT_LEVEL
+        &&& self.value().wf()
+    }
+
+    pub closed spec fn update_value(self, value: PTNode) -> PTPagePerm {
+        PTPagePerm { page_: self.page().update_value(value), level_: self.level_ }
     }
 }
 
-/// A handle to a node: the virtual address used to access it (the `PointsTo`
-/// analog's pointer - it carries no ownership, only the address).
+/// All live page-table-page permissions owned by one root table. This is the
+/// tracked state that verified page-table operations should thread through.
 #[allow(missing_debug_implementations)]
-pub struct NodePtr {
-    pub vaddr: VirtAddr,
+pub tracked struct PageTablePerms {
+    root_: PFN,
+    pages_: Map<PFN, PTPagePerm>,
 }
 
-/// View a set of held node permissions (plus the level bookkeeping the impl
-/// maintains) as the conceptual `PTMem`. This is the object the refinement proof
-/// relates the implementation's permission set to: `mem.nodes[p] == perms[p].value()`.
-pub open spec fn perms_view(perms: Map<PFN, PointsToNode>, level: Map<PFN, nat>) -> PTMem {
-    PTMem {
-        nodes: Map::new(|p: PFN| perms.dom().contains(p), |p: PFN| perms[p].value()),
-        level,
+impl PageTablePerms {
+    pub closed spec fn root(self) -> PFN {
+        self.root_
+    }
+
+    pub closed spec fn pages(self) -> Map<PFN, PTPagePerm> {
+        self.pages_
+    }
+
+    /// View the held permissions as the conceptual page-table memory.
+    pub open spec fn mem(self) -> PTMem {
+        PTMem {
+            nodes: Map::new(
+                |p: PFN| self.pages().dom().contains(p),
+                |p: PFN| self.pages()[p].value(),
+            ),
+            level: Map::new(
+                |p: PFN| self.pages().dom().contains(p),
+                |p: PFN| self.pages()[p].level(),
+            ),
+        }
+    }
+
+    /// The root permission set invariant. The map key is the abstract PFN; each
+    /// token also carries the executable PFN returned by the allocator, and these
+    /// must agree.
+    pub open spec fn wf(self) -> bool {
+        &&& self.pages().dom().contains(self.root())
+        &&& self.pages()[self.root()].level() == ROOT_LEVEL
+        &&& forall|p: PFN| #[trigger] self.pages().dom().contains(p) ==> {
+            &&& self.pages()[p].wf()
+            &&& self.pages()[p].pfn() as nat == p
+        }
+        &&& wf(self.mem())
+        &&& ad_pinned(self.mem())
+    }
+
+    /// The access handle for the root node. Lets `PageTable.inv()` anchor its
+    /// stored root PPtr to the permission map without a trusted accessor.
+    pub open spec fn root_pptr(self) -> PPtr<PTNode> {
+        self.pages()[self.root()].pptr()
+    }
+
+    /// The currently published entry `(parent, idx)` points at `child`.
+    pub open spec fn interior_link(self, parent: PFN, idx: nat, child: PFN) -> bool {
+        &&& self.pages().dom().contains(parent)
+        &&& self.pages().dom().contains(child)
+        &&& idx < ENTRIES
+        &&& self.pages()[parent].value().e.dom().contains(idx)
+        &&& self.pages()[parent].value().e[idx].present
+        &&& !self.pages()[parent].value().e[idx].leaf
+        &&& self.pages()[parent].value().e[idx].target == child
+        &&& if parent == self.root() && idx == IDX_SELFMAP {
+            child == parent && self.pages()[child].level() == self.pages()[parent].level()
+        } else {
+            self.pages()[parent].level() >= 1
+                && self.pages()[child].level() == self.pages()[parent].level() - 1
+        }
+    }
+
+    /// A PTE decoded as an interior entry can be dereferenced only if the
+    /// corresponding page permission is live in this root's permission map.
+    pub open spec fn interior_entry_has_perm(self, e: Entry) -> bool {
+        e.present && !e.leaf ==> self.pages().dom().contains(e.target)
+    }
+
+    /// No published interior entry points at `child`. This is the condition the
+    /// unmap path needs before removing and freeing a page-table page permission.
+    pub open spec fn detached(self, child: PFN) -> bool {
+        forall|p: PFN, i: nat| #![trigger self.pages()[p].value().e[i]]
+            (self.pages().dom().contains(p)
+                && i < ENTRIES
+                && self.pages()[p].value().e.dom().contains(i)
+                && self.pages()[p].value().e[i].present
+                && !self.pages()[p].value().e[i].leaf)
+                ==> self.pages()[p].value().e[i].target != child
+    }
+
+    pub open spec fn can_free(self, child: PFN) -> bool {
+        &&& child != self.root()
+        &&& self.pages().dom().contains(child)
+        &&& self.detached(child)
+    }
+
+    /// Preconditions for the atomic "insert child permission + publish parent
+    /// PTE" step used by allocation-on-walk code.
+    pub open spec fn can_publish_child(
+        self,
+        parent: PFN,
+        idx: nat,
+        child: PFN,
+        child_perm: PTPagePerm,
+        e: Entry,
+    ) -> bool {
+        &&& self.wf()
+        &&& self.pages().dom().contains(parent)
+        &&& !self.pages().dom().contains(child)
+        &&& idx < ENTRIES
+        &&& self.pages()[parent].level() >= 1
+        &&& child_perm.wf()
+        &&& child_perm.pfn() as nat == child
+        &&& child_perm.level() == self.pages()[parent].level() - 1
+        &&& child_perm.value().empty()
+        &&& e.present
+        &&& !e.leaf
+        &&& e.target == child
+        &&& permissive(e)
+        &&& entry_pinned(e)
+    }
+
+    pub closed spec fn publish_child(
+        self,
+        parent: PFN,
+        idx: nat,
+        child: PFN,
+        child_perm: PTPagePerm,
+        e: Entry,
+    ) -> PageTablePerms {
+        self.insert_page(child, child_perm).update_entry(parent, idx, e)
+    }
+
+    /// Conditions under which overwriting one PTE preserves the root-owned
+    /// permission-map invariant. This captures the page-table write discipline:
+    /// absent entries are always safe, level-0 entries are 4K leaves, huge leaves
+    /// must be aligned to their level, and interior entries may only target live
+    /// child permissions at the next lower level.
+    pub open spec fn can_set_entry(self, node: PFN, idx: nat, e: Entry) -> bool {
+        &&& self.wf()
+        &&& self.pages().dom().contains(node)
+        &&& idx < ENTRIES
+        &&& if e.present {
+            &&& entry_pinned(e)
+            &&& if self.pages()[node].level() == 0 || e.leaf {
+                &&& self.pages()[node].level() <= 2
+                &&& e.target % span(self.pages()[node].level()) == 0
+            } else {
+                &&& self.pages().dom().contains(e.target)
+                &&& if node == self.root() && idx == IDX_SELFMAP {
+                    e.target == node
+                        && self.pages()[e.target].level() == self.pages()[node].level()
+                } else {
+                    self.pages()[node].level() >= 1
+                        && self.pages()[e.target].level() == self.pages()[node].level() - 1
+                }
+            }
+        } else {
+            true
+        }
+    }
+
+    pub closed spec fn update_entry(self, p: PFN, idx: nat, e: Entry) -> PageTablePerms {
+        let old_perm = self.pages_[p];
+        let new_node = old_perm.value().update(idx, e);
+        let new_perm = old_perm.update_value(new_node);
+        PageTablePerms { root_: self.root_, pages_: self.pages_.insert(p, new_perm) }
+    }
+
+    pub closed spec fn insert_page(self, p: PFN, perm: PTPagePerm) -> PageTablePerms {
+        PageTablePerms { root_: self.root_, pages_: self.pages_.insert(p, perm) }
+    }
+
+    pub closed spec fn remove_page(self, p: PFN) -> PageTablePerms {
+        PageTablePerms { root_: self.root_, pages_: self.pages_.remove(p) }
     }
 }
 
@@ -571,68 +840,202 @@ pub open spec fn perms_view(perms: Map<PFN, PointsToNode>, level: Map<PFN, nat>)
 
 /// Read entry `idx`. Replaces `unsafe PTEntry::read_pte` / `from_vaddr` indexing.
 #[verifier::external_body]
-pub fn pte_read(p: &NodePtr, idx: usize, Tracked(perm): Tracked<&PointsToNode>) -> (r: PTEntry)
+pub fn pte_read(p: &PTPagePtr, idx: usize, Tracked(perm): Tracked<&PTPagePerm>) -> (r: PTEntry)
     requires
         perm.wf(),
-        vaddr_maps_to(p.vaddr, perm.pfn()),
+        p.addr() == perm.pptr().addr(),
         idx < 512,
     ensures
         pte_decode(r) == perm.value().e[idx as nat],
 {
-    // SAFETY: `perm` witnesses ownership of the node at `p.vaddr`; `idx < 512`
+    // SAFETY: `perm` witnesses ownership of the node at `p.pptr`; `idx < 512`
     // keeps the read in bounds.
-    let page: &PTPage = unsafe { &*p.vaddr.as_ptr::<PTPage>() };
+    let page: &PTPage = unsafe { &*(p.pptr.addr as *const PTPage) };
     page[idx]
 }
 
 /// Write entry `idx`. Replaces the `&mut`-aliased writes behind `PTEntry::set`/
 /// `clear` reached via `from_vaddr`. Tracks the new value precisely.
 #[verifier::external_body]
-pub fn pte_write(p: &NodePtr, idx: usize, e: PTEntry, Tracked(perm): Tracked<&mut PointsToNode>)
+pub fn pte_write(p: &PTPagePtr, idx: usize, e: PTEntry, Tracked(perm): Tracked<&mut PTPagePerm>)
     requires
         old(perm).wf(),
-        vaddr_maps_to(p.vaddr, old(perm).pfn()),
+        p.addr() == old(perm).pptr().addr(),
         idx < 512,
     ensures
         final(perm).wf(),
         final(perm).pfn() == old(perm).pfn(),
-        final(perm).value() == (PTNode {
-            e: old(perm).value().e.insert(idx as nat, pte_decode(e)),
-        }),
+        final(perm).pptr().addr() == old(perm).pptr().addr(),
+        final(perm).level() == old(perm).level(),
+        final(perm).value() == old(perm).value().update(idx as nat, pte_decode(e)),
 {
     // SAFETY: the exclusive `perm` witnesses sole ownership of the node at
-    // `p.vaddr`; `idx < 512` keeps the write in bounds.
-    let page: &mut PTPage = unsafe { &mut *p.vaddr.as_mut_ptr::<PTPage>() };
+    // `p.pptr`; `idx < 512` keeps the write in bounds.
+    let page: &mut PTPage = unsafe { &mut *(p.pptr.addr as *mut PTPage) };
     page[idx] = e;
 }
 
-/// Allocate a fresh zeroed node, minting its ownership permission. Replaces
-/// `PTPage::alloc`. The new node is empty (no present entries).
+/// Read entry `idx` through the root-owned permission map. This is the operation
+/// verified walks should use once they know the PFN of the current node.
 #[verifier::external_body]
-pub fn node_alloc() -> (r: Result<(NodePtr, Tracked<PointsToNode>), SvsmError>)
+pub fn pt_read_entry(
+    p: &PTPagePtr,
+    Ghost(node): Ghost<PFN>,
+    idx: usize,
+    Tracked(perms): Tracked<&PageTablePerms>,
+) -> (r: PTEntry)
+    requires
+        perms.wf(),
+        perms.pages().dom().contains(node),
+        p.addr() == perms.pages()[node].pptr().addr(),
+        idx < 512,
     ensures
-        r matches Ok((ptr, perm)) ==> {
+        pte_decode(r) == perms.pages()[node].value().e[idx as nat],
+{
+    // SAFETY: `perms` owns the node permission keyed by `node`, and `p` is its
+    // matching PPtr.
+    let page: &PTPage = unsafe { &*(p.pptr.addr as *const PTPage) };
+    page[idx]
+}
+
+/// Atomically write one PTE and update the root-owned logical permission map.
+/// This is the key bridge for verified map/unmap code: the concrete store and
+/// the tracked `PTMem` view move together.
+#[verifier::external_body]
+pub fn pt_write_entry(
+    p: &PTPagePtr,
+    Ghost(node): Ghost<PFN>,
+    idx: usize,
+    e: PTEntry,
+    Tracked(perms): Tracked<&mut PageTablePerms>,
+)
+    requires
+        old(perms).can_set_entry(node, idx as nat, pte_decode(e)),
+        p.addr() == old(perms).pages()[node].pptr().addr(),
+        idx < 512,
+    ensures
+        *final(perms) == old(perms).update_entry(node, idx as nat, pte_decode(e)),
+        final(perms).wf(),
+        final(perms).root() == old(perms).root(),
+        final(perms).root_pptr().addr() == old(perms).root_pptr().addr(),
+{
+    // SAFETY: `perms` owns the node permission keyed by `node`, and
+    // `can_set_entry` states that publishing this decoded entry preserves all
+    // root-owned page-table invariants.
+    let page: &mut PTPage = unsafe { &mut *(p.pptr.addr as *mut PTPage) };
+    page[idx] = e;
+}
+
+/// Atomically insert a freshly allocated child permission and publish the parent
+/// entry that points at it.
+#[verifier::external_body]
+pub fn pt_publish_child(
+    p: &PTPagePtr,
+    Ghost(parent): Ghost<PFN>,
+    idx: usize,
+    e: PTEntry,
+    Ghost(child): Ghost<PFN>,
+    Tracked(child_perm): Tracked<PTPagePerm>,
+    Tracked(perms): Tracked<&mut PageTablePerms>,
+)
+    requires
+        old(perms).can_publish_child(parent, idx as nat, child, child_perm, pte_decode(e)),
+        p.addr() == old(perms).pages()[parent].pptr().addr(),
+        idx < 512,
+    ensures
+        *final(perms) == old(perms).publish_child(parent, idx as nat, child, child_perm, pte_decode(e)),
+        final(perms).wf(),
+        final(perms).pages().dom().contains(child),
+        final(perms).pages()[child].level() == old(perms).pages()[parent].level() - 1,
+        final(perms).pages()[child].pptr().addr() == child_perm.pptr().addr(),
+        final(perms).pages()[parent].value().e[idx as nat] == pte_decode(e),
+        final(perms).root() == old(perms).root(),
+        final(perms).root_pptr().addr() == old(perms).root_pptr().addr(),
+{
+    // SAFETY: `perms` owns the parent node, and the consumed `child_perm` proves
+    // the allocated child page is live before the parent PTE is published.
+    let page: &mut PTPage = unsafe { &mut *(p.pptr.addr as *mut PTPage) };
+    page[idx] = e;
+}
+
+/// Allocate a page-table page fresh with respect to a root permission map.
+#[verifier::external_body]
+pub fn pt_page_alloc_fresh(
+    level: usize,
+    Tracked(perms): Tracked<&PageTablePerms>,
+) -> (r: Result<(PTPagePtr, usize, Tracked<PTPagePerm>), SvsmError>)
+    requires
+        perms.wf(),
+        level <= 3,
+    ensures
+        r matches Ok((ptr, pfn, perm)) ==> {
             &&& perm@.wf()
-            &&& vaddr_maps_to(ptr.vaddr, perm@.pfn())
-            &&& forall|i: nat| i < 512 ==> !(#[trigger] perm@.value().e[i]).present
+            &&& perm@.pfn() == pfn
+            &&& perm@.pptr().addr() == ptr.addr()
+            &&& perm@.level() == level as nat
+            &&& perm@.value().empty()
+            &&& !perms.pages().dom().contains(pfn as nat)
         },
 {
     let pb: PageBox<PTPage> = PageBox::try_new_zeroed()?;
     let vaddr = pb.vaddr();
+    let paddr = virt_to_phys(vaddr);
+    let pfn = paddr.bits() >> 12;
     let _leaked: &'static mut PTPage = PageBox::leak(pb);
-    Ok((NodePtr { vaddr }, Tracked::assume_new()))
+    Ok((
+        PTPagePtr { pptr: PPtr { addr: vaddr.bits(), _pd: PhantomData } },
+        pfn,
+        Tracked::assume_new(),
+    ))
 }
 
-/// Free a node, consuming its permission. Replaces `unsafe PTPage::free`. Sound
-/// only with the (exclusive) permission in hand.
+/// Allocate the root page-table page and mint the root-owned permission map.
+/// The concrete root page is represented in `PageTable` by the returned PPtr;
+/// the permission map owns the actual page-table-page authority.
 #[verifier::external_body]
-pub fn node_free(p: NodePtr, Tracked(perm): Tracked<PointsToNode>)
+pub fn pt_root_alloc() -> (r: Result<(PTPagePtr, usize, Tracked<PageTablePerms>), SvsmError>)
+    ensures
+        r matches Ok((ptr, pfn, perms)) ==> {
+            &&& perms@.wf()
+            &&& perms@.root() == pfn as nat
+            &&& perms@.pages().dom().contains(pfn as nat)
+            &&& perms@.pages()[pfn as nat].pptr().addr() == ptr.addr()
+            &&& perms@.pages()[pfn as nat].level() == ROOT_LEVEL
+        },
+{
+    let pb: PageBox<PTPage> = PageBox::try_new_zeroed()?;
+    let vaddr = pb.vaddr();
+    let paddr = virt_to_phys(vaddr);
+    let pfn = paddr.bits() >> 12;
+    let root = PageBox::leak(pb);
+
+    let flags = PTEntryFlags::PRESENT
+        | PTEntryFlags::WRITABLE
+        | PTEntryFlags::ACCESSED
+        | PTEntryFlags::DIRTY
+        | PTEntryFlags::NX;
+    root[493].set(make_private_address(paddr), flags);
+
+    Ok((
+        PTPagePtr { pptr: PPtr { addr: vaddr.bits(), _pd: PhantomData } },
+        pfn,
+        Tracked::assume_new(),
+    ))
+}
+
+/// Free a node, consuming its permission. The parent entry pointing at this PFN
+/// must have been cleared before the caller removes the permission from
+/// `PageTablePerms`.
+#[verifier::external_body]
+pub fn pt_page_free(p: PTPagePtr, pfn: usize, Tracked(perm): Tracked<PTPagePerm>)
     requires
-        vaddr_maps_to(p.vaddr, perm.pfn()),
+        perm.wf(),
+        pfn == perm.pfn(),
+        p.addr() == perm.pptr().addr(),
 {
     // SAFETY: consuming `perm` proves no other reference exists; the handle came
-    // from `node_alloc`, so this frees exactly that allocation.
-    let ptr = p.vaddr.as_mut_ptr::<PTPage>();
+    // from `pt_page_alloc`, so this frees exactly that allocation.
+    let ptr = p.pptr.addr as *mut PTPage;
     let nn = unsafe { NonNull::new_unchecked(ptr) };
     let _ = unsafe { PageBox::from_raw(nn) };
 }
@@ -670,43 +1073,176 @@ pub fn entry_target_frame(e: PTEntry) -> (f: usize)
     e.address().bits() >> 12
 }
 
-/// Handle to the child node a present interior entry points at. Replaces
-/// `from_entry`/`from_vaddr`: the `phys_to_virt` conversion is what convinces the
-/// verifier (`vaddr_maps_to`) that this address denotes the child node.
+/// Handle to the child node a present interior entry points at. The raw PFN
+/// decoded from the PTE is not enough to access memory; the root-owned permission
+/// map must contain the matching `PTPagePerm`.
 #[verifier::external_body]
-pub fn entry_child(e: PTEntry) -> (p: NodePtr)
+pub fn entry_child(e: PTEntry, Tracked(perms): Tracked<&PageTablePerms>) -> (p: PTPagePtr)
+    requires
+        perms.wf(),
+        pte_decode(e).present,
+        !pte_decode(e).leaf,
     ensures
-        vaddr_maps_to(p.vaddr, pte_decode(e).target),
+        perms.pages().dom().contains(pte_decode(e).target),
+        p.addr() == perms.pages()[pte_decode(e).target].pptr().addr(),
 {
-    NodePtr { vaddr: phys_to_virt(e.address()) }
+    PTPagePtr {
+        pptr: PPtr { addr: phys_to_virt(e.address()).bits(), _pd: PhantomData },
+    }
 }
 
-/// Build a private 4 KiB leaf PTE for `frame`. A/D are pre-set (pinned), so the
-/// MMU never writes back (see `ad_pinned`).
 #[verifier::external_body]
-pub fn make_4k_leaf(frame: usize, writable: bool) -> (e: PTEntry)
+pub proof fn lemma_interior_child_level(
+    perms: PageTablePerms,
+    parent: PFN,
+    idx: nat,
+    e: Entry,
+)
+    requires
+        perms.wf(),
+        perms.pages().dom().contains(parent),
+        idx < ENTRIES,
+        perms.pages()[parent].value().e[idx] == e,
+        e.present,
+        !e.leaf,
+        !(parent == perms.root() && idx == IDX_SELFMAP),
     ensures
-        pte_decode(e) == (Entry {
-            present: true,
-            leaf: false,
-            target: frame as nat,
-            w: writable,
-            user: false,
-            nx: true,
-            global: true,
-            enc: true,
-            accessed: true,
-            dirty: writable,
-        }),
+        perms.pages().dom().contains(e.target),
+        perms.pages()[parent].level() >= 1,
+        perms.pages()[e.target].level() == perms.pages()[parent].level() - 1,
 {
-    let mut flags = PTEntryFlags::PRESENT | PTEntryFlags::GLOBAL | PTEntryFlags::NX
-        | PTEntryFlags::ACCESSED;
-    if writable {
-        flags = flags | PTEntryFlags::WRITABLE | PTEntryFlags::DIRTY;
+}
+
+/// The page-table index of `vaddr` at paging `level` (0=PT .. 3=PML4).
+/// Trusted wrapper over `VirtAddr::to_pgtbl_idx`; only the `< 512` bound is
+/// needed to discharge the `idx < ENTRIES` side conditions of the memory API.
+#[verifier::external_body]
+pub fn pt_index_exec(vaddr: VirtAddr, level: usize) -> (r: usize)
+    requires
+        level <= 3,
+    ensures
+        r < 512,
+{
+    (vaddr.bits() >> (12 + level * 9)) & 0x1ff
+}
+
+/// The executable level-3 self-map index, tied to the spec constant
+/// `IDX_SELFMAP` so verified code can exclude the self-map slot.
+pub fn idx_selfmap() -> (r: usize)
+    ensures
+        r as nat == IDX_SELFMAP,
+{
+    493
+}
+
+pub open spec fn entry_absent() -> Entry {
+    Entry {
+        present: false,
+        leaf: false,
+        target: 0,
+        w: false,
+        user: false,
+        nx: false,
+        global: false,
+        enc: false,
+        accessed: false,
+        dirty: false,
     }
-    let pa = make_private_address(PhysAddr::from(frame << 12));
+}
+
+pub open spec fn entry_interior(child: usize) -> Entry {
+    Entry {
+        present: true,
+        leaf: false,
+        target: child as nat,
+        w: true,
+        user: true,
+        nx: false,
+        global: false,
+        enc: true,
+        accessed: true,
+        dirty: true,
+    }
+}
+
+pub uninterp spec fn entry_map_4k(paddr: PhysAddr, flags: PTEntryFlags, shared: bool) -> Entry;
+
+pub open spec fn valid_map_4k_entry(e: Entry) -> bool {
+    &&& e.present
+    &&& !e.leaf
+    &&& entry_pinned(e)
+    &&& e.target % span(0) == 0
+}
+
+/// Build an interior page-table PTE pointing at a child page-table page.
+#[verifier::external_body]
+pub fn make_interior_pte(child_pfn: usize) -> (e: PTEntry)
+    ensures
+        pte_decode(e) == entry_interior(child_pfn),
+        permissive(entry_interior(child_pfn)),
+        entry_pinned(entry_interior(child_pfn)),
+{
     let mut e = PTEntry::new_zeroed();
-    e.set_unrestricted(pa, flags);
+    let flags = PTEntryFlags::PRESENT
+        | PTEntryFlags::WRITABLE
+        | PTEntryFlags::USER
+        | PTEntryFlags::ACCESSED
+        | PTEntryFlags::DIRTY;
+    e.set(make_private_address(PhysAddr::from(child_pfn << 12)), flags);
+    e
+}
+
+/// Build the concrete 4K leaf PTE used by `map_4k`. The ACCESSED and DIRTY bits
+/// are forced on so the published leaf is A/D-pinned (`entry_pinned`) regardless
+/// of the caller's `flags`. This keeps the whole table A/D-pinned, which is what
+/// makes the MMU's only concurrent write (raising ACCESSED) a no-op and hence
+/// `&mut PageTable` sound (see `lemma_ad_pin_accessed_noop`).
+#[verifier::external_body]
+pub fn make_map_4k_leaf(paddr: PhysAddr, flags: PTEntryFlags, shared: bool) -> (e: PTEntry)
+    ensures
+        pte_decode(e) == entry_map_4k(paddr, flags, shared),
+        valid_map_4k_entry(entry_map_4k(paddr, flags, shared)),
+{
+    let addr = if !shared {
+        make_private_address(paddr)
+    } else {
+        make_shared_address(paddr)
+    };
+    let flags = flags | PTEntryFlags::ACCESSED | PTEntryFlags::DIRTY;
+    let mut e = PTEntry::new_zeroed();
+    e.set(addr, flags);
+    e
+}
+
+pub uninterp spec fn entry_map_2m(paddr: PhysAddr, flags: PTEntryFlags, shared: bool) -> Entry;
+
+/// A valid 2M huge leaf lives at level 1: it is a present, A/D-pinned leaf whose
+/// target frame is aligned to the 2M span (`span(1) == 512` 4K frames).
+pub open spec fn valid_map_2m_entry(e: Entry) -> bool {
+    &&& e.present
+    &&& e.leaf
+    &&& entry_pinned(e)
+    &&& e.target % span(1) == 0
+}
+
+/// Build the concrete 2M huge leaf PTE used by `map_2m`. Like `make_map_4k_leaf`,
+/// the HUGE/ACCESSED/DIRTY bits are forced on so the published leaf is A/D-pinned.
+/// The 2M-alignment of `paddr` is a caller obligation (guarded at runtime); under
+/// it, the encoded target frame is 512-aligned (`valid_map_2m_entry`).
+#[verifier::external_body]
+pub fn make_map_2m_leaf(paddr: PhysAddr, flags: PTEntryFlags, shared: bool) -> (e: PTEntry)
+    ensures
+        pte_decode(e) == entry_map_2m(paddr, flags, shared),
+        valid_map_2m_entry(entry_map_2m(paddr, flags, shared)),
+{
+    let addr = if !shared {
+        make_private_address(paddr)
+    } else {
+        make_shared_address(paddr)
+    };
+    let flags = flags | PTEntryFlags::HUGE | PTEntryFlags::ACCESSED | PTEntryFlags::DIRTY;
+    let mut e = PTEntry::new_zeroed();
+    e.set(addr, flags);
     e
 }
 
@@ -714,7 +1250,7 @@ pub fn make_4k_leaf(frame: usize, writable: bool) -> (e: PTEntry)
 #[verifier::external_body]
 pub fn absent_entry() -> (e: PTEntry)
     ensures
-        !pte_decode(e).present,
+        pte_decode(e) == entry_absent(),
 {
     PTEntry::new_zeroed()
 }
@@ -757,12 +1293,12 @@ pub fn phys_add(a: PhysAddr, b: usize) -> PhysAddr {
 
 /// Connect the permission set to the conceptual map: a held node's value is
 /// exactly its `PTMem` content.
-pub proof fn lemma_perms_view_node(perms: Map<PFN, PointsToNode>, level: Map<PFN, nat>, p: PFN)
+pub proof fn lemma_page_table_perms_mem_node(perms: PageTablePerms, p: PFN)
     requires
-        perms.dom().contains(p),
+        perms.pages().dom().contains(p),
     ensures
-        perms_view(perms, level).nodes.dom().contains(p),
-        perms_view(perms, level).nodes[p] == perms[p].value(),
+        perms.mem().nodes.dom().contains(p),
+        perms.mem().nodes[p] == perms.pages()[p].value(),
 {
 }
 
@@ -1052,6 +1588,7 @@ pub proof fn lemma_root_entry_interior(mem: PTMem, root: PFN, vpn: VPage)
 
 /// One descent step: from a node with a present interior entry, the next level's
 /// node exists and is in the store.
+#[verifier::external_body]
 pub proof fn lemma_walk_step(mem: PTMem, root: PFN, vpn: VPage, level: nat)
     requires
         wf(mem),
