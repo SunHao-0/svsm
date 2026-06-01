@@ -55,6 +55,16 @@ pub trait PtPage: ZeroInit + Sized {
     /// `PTNode::update`.
     spec fn view(&self) -> PTNode;
 
+    /// Every page maps to a *structurally* well-formed node: the full
+    /// architectural entry set (`PTNode::wf`). This holds for any contents, since
+    /// editing entries changes their meaning, not the entry set. It is what lets
+    /// a node permission hand out a raw `&mut Self` (`node_borrow_mut`) without
+    /// losing `PTNodePerm::wf()`. The author discharges it once, structurally.
+    proof fn view_wf(&self)
+        ensures
+            self.view().wf(),
+    ;
+
     /// A freshly zeroed page maps to the empty node (no present entries). This is
     /// what lets `node_alloc` mint a well-formed, empty node.
     proof fn zeroed_is_empty()
@@ -70,16 +80,26 @@ pub trait PtPage: ZeroInit + Sized {
             Self::decode(pte) == self.view().e[i as nat],
     ;
 
-    /// Write entry `i` in place. The abstract node updates at exactly `i`, and the
-    /// page stays well-formed (the full architectural entry set). The author
-    /// discharges both facts once, from real array manipulation.
+    /// Write entry `i` in place. The abstract node updates at exactly `i`
+    /// (well-formedness of the result follows from `view_wf`).
     fn set(&mut self, i: usize, pte: Self::Pte)
         requires
             i < 512,
         ensures
             final(self).view() == old(self).view().update(i as nat, Self::decode(pte)),
-            final(self).view().wf(),
     ;
+}
+
+/// Every page of a given `PtPage` type maps to a structurally well-formed node.
+/// The universal form lets the node operations re-establish `node().wf()` after
+/// handing out a raw `&mut Self`, where the resulting page value is not known.
+pub proof fn lemma_all_views_wf<V: PtPage>()
+    ensures
+        forall|v: V| (#[trigger] v.view()).wf(),
+{
+    assert forall|v: V| (#[trigger] v.view()).wf() by {
+        v.view_wf();
+    }
 }
 
 // =====================================================================
@@ -166,6 +186,48 @@ pub fn node_alloc<V: PtPage>(level: usize) -> (r: Result<
     Ok((va, pa, Tracked(node)))
 }
 
+/// Borrow the node's page immutably. The returned `&V` is the live page, and its
+/// `view()` is the node this permission maps to. This hands the author the
+/// tracked value directly - they may read it however they like, not only through
+/// `node_read_entry`.
+pub fn node_borrow<'a, V: PtPage>(va: VA, Tracked(perm): Tracked<&'a PTNodePerm<V>>) -> (r: &'a V)
+    requires
+        perm.wf(),
+        va == perm.va(),
+    ensures
+        (*r).view() == perm.node(),
+{
+    page_borrow::<V>(va, Tracked(&perm.perm))
+}
+
+/// Borrow the node's page mutably. The returned `&mut V` is the live page; the
+/// permission tracks the final value and its mapped node follows. This is the
+/// handle through which the author manipulates the page in place with their own
+/// code - any sequence of `PtPage::set` calls, or any other editing - rather than
+/// being forced through `node_set_entry`. `wf()` is preserved for *any* resulting
+/// page, because `view_wf` guarantees every page maps to a structurally
+/// well-formed node.
+pub fn node_borrow_mut<'a, V: PtPage>(
+    va: VA,
+    Tracked(perm): Tracked<&'a mut PTNodePerm<V>>,
+) -> (r: &'a mut V)
+    requires
+        old(perm).wf(),
+        va == old(perm).va(),
+    ensures
+        (*r).view() == old(perm).node(),
+        final(perm).node() == (*final(r)).view(),
+        final(perm).wf(),
+        final(perm).va() == old(perm).va(),
+        final(perm).pa() == old(perm).pa(),
+        final(perm).level() == old(perm).level(),
+{
+    proof {
+        lemma_all_views_wf::<V>();
+    }
+    page_borrow_mut::<V>(va, Tracked(&mut perm.perm))
+}
+
 /// Read entry `i` of the node. Returns the concrete entry; its decoding is the
 /// abstract entry the node maps to at `i`.
 pub fn node_read_entry<V: PtPage>(
@@ -203,6 +265,9 @@ pub fn node_set_entry<V: PtPage>(
         final(perm).level() == old(perm).level(),
         final(perm).node() == old(perm).node().update(i as nat, V::decode(pte)),
 {
+    proof {
+        lemma_all_views_wf::<V>();
+    }
     let page: &mut V = page_borrow_mut::<V>(va, Tracked(&mut perm.perm));
     page.set(i, pte);
 }
@@ -231,12 +296,18 @@ pub fn node_demo<V: PtPage>(pte: V::Pte) {
         Err(_) => return,
     };
 
-    // Write `pte` at index 5; the abstract node now decodes to `pte` there.
+    // (A) Entry-level convenience: write via `node_set_entry`, read it back.
     node_set_entry::<V>(va, Tracked(perm.borrow_mut()), 5, pte);
-
-    // Read it back: the decoded entry matches what we wrote.
     let got = node_read_entry::<V>(va, Tracked(perm.borrow()), 5);
     assert(V::decode(got) == V::decode(pte));
+
+    // (B) Obtain the tracked page directly and manipulate it in place with the
+    //     author's own method - no forced get/set wrapper. The mapped node
+    //     follows the edit, and the permission stays well-formed.
+    let page: &mut V = node_borrow_mut::<V>(va, Tracked(perm.borrow_mut()));
+    page.set(7, pte);
+    let got7 = node_read_entry::<V>(va, Tracked(perm.borrow()), 7);
+    assert(V::decode(got7) == V::decode(pte));
 
     // Reclaim the node: consumes `perm`, so no use-after-free is possible.
     node_free::<V>(va, perm);
