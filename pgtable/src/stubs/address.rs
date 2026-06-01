@@ -4,9 +4,9 @@
 //
 // Author: Carlos López <carlos.lopez@suse.com>
 
+use crate::stubs::types::{PAGE_SHIFT, PAGE_SIZE};
 use crate::stubs::virt_to_phys;
 use crate::stubs::{align_down, align_up, is_aligned};
-use crate::types::{PAGE_SHIFT, PAGE_SIZE};
 
 use core::fmt;
 use core::ops;

@@ -4,14 +4,19 @@
 //
 // Author: Joerg Roedel <jroedel@suse.de>
 
+// In the kernel these come from many modules (cpu, mm, platform, utils, ...);
+// here they are all provided by the trusted `stubs` module so this file can stay
+// a direct copy of `kernel/src/mm/pagetable.rs`.
 use crate::BIT_MASK;
-use crate::address::{Address, PhysAddr, VirtAddr};
-use crate::memory_region::MemoryRegion;
+use crate::stubs::address::{Address, PhysAddr, VirtAddr};
 use crate::stubs::{
-    PageBox, SvsmError, flush_tlb_global_sync, phys_to_virt, virt_to_phys, write_cr3,
+    ImmutAfterInitCell, ImmutAfterInitResult, MemoryRegion, PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M,
+    PGTABLE_LVL3_IDX_PTE_SELFMAP, PGTABLE_LVL3_IDX_SHARED, PageBox, PageFaultError, PageSize,
+    RFlags, SVSM_PTE_BASE, SvsmError, SvsmPlatform, flush_tlb_global_sync, phys_to_virt,
+    virt_to_phys, write_cr3,
 };
-use crate::types::{PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize};
 use bitflags::bitflags;
+use core::cmp;
 use core::ops::{Index, IndexMut};
 use core::ptr::NonNull;
 use cpuarch::x86::CR0Flags;
@@ -20,59 +25,89 @@ use cpuarch::x86::EFERFlags;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 
-#[cfg(verus_only)]
-use crate::specs::{
-    IDX_SELFMAP, PFN, PTPagePtr, PageTablePerms, ROOT_LEVEL, absent_entry, entry_child, entry_huge,
-    entry_present, idx_selfmap, lemma_interior_child_level, make_interior_pte, make_map_2m_leaf,
-    make_map_4k_leaf, pt_index_exec, pt_page_alloc_fresh, pt_publish_child, pt_read_entry,
-    pt_root_alloc, pt_write_entry, pte_decode, svsm_mem_error,
-};
-#[cfg(verus_only)]
-use vstd::prelude::*;
-
 /// Number of entries in a page table (4KB/8B).
 pub const ENTRY_COUNT: usize = 512;
 
-// Page-table self-map constants (inlined from kernel/src/mm/address_space.rs).
+/// Mask for private page table entry.
+static PRIVATE_PTE_MASK: ImmutAfterInitCell<usize> = ImmutAfterInitCell::uninit();
 
-/// Computes the canonical virtual base address for a top-level (PML4) index.
-pub const fn virt_from_idx(idx: usize) -> VirtAddr {
-    VirtAddr::new(idx << ((3 * 9) + 12))
+/// Mask for shared page table entry.
+static SHARED_PTE_MASK: ImmutAfterInitCell<usize> = ImmutAfterInitCell::uninit();
+
+/// Maximum physical address supported by the system.
+static MAX_PHYS_ADDR: ImmutAfterInitCell<u64> = ImmutAfterInitCell::uninit();
+
+/// Maximum physical address bits supported by the system.
+static PHYS_ADDR_SIZE: ImmutAfterInitCell<u32> = ImmutAfterInitCell::uninit();
+
+/// Physical address for the Launch VMSA (Virtual Machine Saving Area).
+pub const LAUNCH_VMSA_ADDR: PhysAddr = PhysAddr::new(0xFFFFFFFFF000);
+
+/// Feature mask for page table entry flags.
+static FEATURE_MASK: ImmutAfterInitCell<PTEntryFlags> = ImmutAfterInitCell::uninit();
+
+/// Initializes paging settings.
+pub fn paging_init(platform: &dyn SvsmPlatform, suppress_global: bool) -> ImmutAfterInitResult<()> {
+    init_encrypt_mask(platform)?;
+
+    let mut feature_mask = PTEntryFlags::all();
+    if suppress_global {
+        feature_mask.remove(PTEntryFlags::GLOBAL);
+    }
+    FEATURE_MASK.init(feature_mask)
 }
 
-/// Level-3 (PML4) index for the shared half of the address space.
-pub const PGTABLE_LVL3_IDX_SHARED: usize = 511;
+/// Initializes the encrypt mask.
+fn init_encrypt_mask(platform: &dyn SvsmPlatform) -> ImmutAfterInitResult<()> {
+    let masks = platform.get_page_encryption_masks();
 
-/// Level-3 (PML4) index used for the page-table self-map.
-pub const PGTABLE_LVL3_IDX_PTE_SELFMAP: usize = 493;
+    PRIVATE_PTE_MASK.init(masks.private_pte_mask)?;
+    SHARED_PTE_MASK.init(masks.shared_pte_mask)?;
 
-/// Virtual base address of the page-table self-map.
-pub const SVSM_PTE_BASE: VirtAddr = virt_from_idx(PGTABLE_LVL3_IDX_PTE_SELFMAP);
+    let guest_phys_addr_size = (masks.phys_addr_sizes >> 16) & 0xff;
+    let host_phys_addr_size = masks.phys_addr_sizes & 0xff;
+    let phys_addr_size = if guest_phys_addr_size == 0 {
+        // When [GuestPhysAddrSize] is zero, refer to the PhysAddrSize field
+        // for the maximum guest physical address size.
+        // - APM3, E.4.7 Function 8000_0008h - Processor Capacity Parameters and Extended Feature Identification
+        host_phys_addr_size
+    } else {
+        guest_phys_addr_size
+    };
 
-const PHYS_ADDR_SIZE: usize = 48;
+    PHYS_ADDR_SIZE.init(phys_addr_size)?;
+
+    // If the C-bit is a physical address bit however, the guest physical
+    // address space is effectively reduced by 1 bit.
+    // - APM2, 15.34.6 Page Table Support
+    let effective_phys_addr_size = cmp::min(masks.addr_mask_width, phys_addr_size);
+
+    let max_addr = 1 << effective_phys_addr_size;
+    MAX_PHYS_ADDR.init(max_addr)
+}
 
 /// Returns the private encrypt mask value.
 pub fn private_pte_mask() -> usize {
-    todo!()
+    *PRIVATE_PTE_MASK
 }
 
 /// Returns the shared encrypt mask value.
 fn shared_pte_mask() -> usize {
-    todo!()
+    *SHARED_PTE_MASK
 }
 
 /// Returns the exclusive end of the physical address space.
 pub fn max_phys_addr() -> PhysAddr {
-    todo!()
+    PhysAddr::from(*MAX_PHYS_ADDR)
 }
 
-/// Returns the supported flags considering the feature mask (all flags here).
+/// Returns the supported flags considering the feature mask.
 fn supported_flags(flags: PTEntryFlags) -> PTEntryFlags {
-    todo!()
+    flags & *FEATURE_MASK
 }
 
 /// Set address as shared via mask.
-pub fn make_shared_address(paddr: PhysAddr) -> PhysAddr {
+fn make_shared_address(paddr: PhysAddr) -> PhysAddr {
     (strip_confidentiality_bits(paddr).bits() | shared_pte_mask()).into()
 }
 
@@ -134,6 +169,43 @@ impl PTEntryFlags {
     }
 }
 
+/// Represents paging mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PagingMode {
+    // Paging mode is disabled
+    NoPaging,
+    // 32bit legacy paging mode
+    NonPAE,
+    // 32bit PAE paging mode
+    PAE,
+    // 4 level paging mode
+    PML4,
+    // 5 level paging mode
+    PML5,
+}
+
+impl PagingMode {
+    pub fn new(efer: EFERFlags, cr0: CR0Flags, cr4: CR4Flags) -> Self {
+        if !cr0.contains(CR0Flags::PG) {
+            // Paging is disabled
+            PagingMode::NoPaging
+        } else if efer.contains(EFERFlags::LMA) {
+            // Long mode is activated
+            if cr4.contains(CR4Flags::LA57) {
+                PagingMode::PML5
+            } else {
+                PagingMode::PML4
+            }
+        } else if cr4.contains(CR4Flags::PAE) {
+            // PAE mode
+            PagingMode::PAE
+        } else {
+            // Non PAE mode
+            PagingMode::NonPAE
+        }
+    }
+}
+
 /// Represents a page table entry.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, FromBytes)]
@@ -178,6 +250,98 @@ impl PTEntry {
     /// Check if the page table entry is global.
     pub fn global(&self) -> bool {
         self.flags().contains(PTEntryFlags::GLOBAL)
+    }
+
+    /// Check if the page table entry has reserved bits set.
+    pub fn has_reserved_bits(&self, pm: PagingMode, level: usize) -> bool {
+        let reserved_mask = match pm {
+            PagingMode::NoPaging => unreachable!("NoPaging does not have page table"),
+            PagingMode::NonPAE => {
+                match level {
+                    // No reserved bits in 4k PTE.
+                    0 => 0,
+                    1 => {
+                        if self.huge() {
+                            // Bit21 is reserved in 4M PDE.
+                            BIT_MASK!(21, 21)
+                        } else {
+                            // No reserved bits in PDE.
+                            0
+                        }
+                    }
+                    _ => unreachable!("Invalid NonPAE page table level"),
+                }
+            }
+            PagingMode::PAE => {
+                // Bit62 ~ MAXPHYSADDR are reserved for each
+                // level in PAE page table.
+                BIT_MASK!(62, *PHYS_ADDR_SIZE)
+                    | match level {
+                        // No additional reserved bits in 4k PTE.
+                        0 => 0,
+                        1 => {
+                            if self.huge() {
+                                // Bit20 ~ Bit13 are reserved in 2M PDE.
+                                BIT_MASK!(20, 13)
+                            } else {
+                                // No additional reserved bits in PDE.
+                                0
+                            }
+                        }
+                        // Bit63 and Bit8 ~ Bit5 are reserved in PDPTE.
+                        2 => BIT_MASK!(63, 63) | BIT_MASK!(8, 5),
+                        _ => unreachable!("Invalid PAE page table level"),
+                    }
+            }
+            PagingMode::PML4 | PagingMode::PML5 => {
+                // Bit51 ~ MAXPHYSADDR are reserved for each level
+                // in PML4 and PML5 page table.
+                let common = if *PHYS_ADDR_SIZE > 51 {
+                    0
+                } else {
+                    // Remove the encryption mask bit as this bit is not reserved
+                    BIT_MASK!(51, *PHYS_ADDR_SIZE)
+                        & !((shared_pte_mask() | private_pte_mask()) as u64)
+                };
+
+                common
+                    | match level {
+                        // No additional reserved bits in 4k PTE.
+                        0 => 0,
+                        1 => {
+                            if self.huge() {
+                                // Bit20 ~ Bit13 are reserved in 2M PDE.
+                                BIT_MASK!(20, 13)
+                            } else {
+                                // No additional reserved bits in PDE.
+                                0
+                            }
+                        }
+                        2 => {
+                            if self.huge() {
+                                // Bit29 ~ Bit13 are reserved in 1G PDPTE.
+                                BIT_MASK!(29, 13)
+                            } else {
+                                // No additional reserved bits in PDPTE.
+                                0
+                            }
+                        }
+                        // Bit8 ~ Bit7 are reserved in PML4E.
+                        3 => BIT_MASK!(8, 7),
+                        4 => {
+                            if pm == PagingMode::PML4 {
+                                unreachable!("Invalid PML4 page table level");
+                            } else {
+                                // Bit8 ~ Bit7 are reserved in PML5E.
+                                BIT_MASK!(8, 7)
+                            }
+                        }
+                        _ => unreachable!("Invalid PML4/PML5 page table level"),
+                    }
+            }
+        };
+
+        self.raw() & reserved_mask != 0
     }
 
     /// Get the raw bits (`u64`) of the page table entry.
@@ -319,34 +483,13 @@ impl IndexMut<usize> for PTPage {
     }
 }
 
-/// Raw, borrow-based mapping levels of page table entries.
-///
-/// This is the original `&mut PTEntry`-based view. It is used only by the
-/// untracked [`RawPageTablePart`] subtree, whose pages are not owned by the
-/// root permission map and therefore cannot be threaded through the verified
-/// permission API. The verified `PageTable` uses the location-based [`Mapping`]
-/// defined in the `verus!` block at the end of this file.
+/// Mapping levels of page table entries.
 #[derive(Debug)]
-pub enum RawMapping<'a> {
+pub enum Mapping<'a> {
     Level3(&'a mut PTEntry),
     Level2(&'a mut PTEntry),
     Level1(&'a mut PTEntry),
     Level0(&'a mut PTEntry),
-}
-
-/// Dereference the page-table entry identified by a location-based [`Mapping`]
-/// slot.
-///
-/// # Safety
-/// `loc.ptr` must address a live page-table page owned by the root permission
-/// map and `loc.idx` must be `< 512`; both hold for any `loc` produced by the
-/// verified `walk_addr`/`alloc_pte_*` helpers. This is the trusted bridge that
-/// lets the not-yet-verified huge-page / region / shared-state methods mutate
-/// an entry identified only by its `(ptr, idx)` location.
-#[cfg(verus_only)]
-#[inline]
-unsafe fn loc_entry_mut<'a>(loc: &PTLoc) -> &'a mut PTEntry {
-    unsafe { &mut (*(loc.ptr.pptr.addr as *mut PTPage)).entries[loc.idx] }
 }
 
 /// A physical address within a page frame
@@ -392,23 +535,13 @@ impl PageFrame {
 }
 
 /// Page table structure containing a root page with multiple entries.
-///
-/// The concrete root page is owned by the tracked `perms`; `root` is just the
-/// access handle (direct-map pointer) anchored to it by `inv()`. The struct and
-/// the verified operations on it live in the `verus!` block at the end of this
-/// file; all the legacy (trusted) methods are in the plain `impl` below.
+#[repr(C)]
+#[derive(Debug, FromZeros)]
+pub struct PageTable {
+    root: PTPage,
+}
+
 impl PageTable {
-    fn root(&self) -> &PTPage {
-        // SAFETY: `root` is the access handle for the root page owned by
-        // `perms`; it remains valid until `Drop`.
-        unsafe { &*(self.root.pptr.addr as *const PTPage) }
-    }
-
-    fn root_mut(&mut self) -> &mut PTPage {
-        // SAFETY: `&mut self` gives exclusive access to the root page.
-        unsafe { &mut *(self.root.pptr.addr as *mut PTPage) }
-    }
-
     /// Load the current page table into the CR3 register.
     ///
     /// # Safety
@@ -424,7 +557,28 @@ impl PageTable {
 
     /// Get the CR3 register value for the current page table.
     pub fn cr3_value(&self) -> PhysAddr {
-        virt_to_phys(VirtAddr::from(self.root.pptr.addr))
+        let pgtable = VirtAddr::from(self as *const Self);
+        virt_to_phys(pgtable)
+    }
+
+    /// Allocate a new page table root.
+    ///
+    /// # Errors
+    /// Returns [`SvsmError`] if the page cannot be allocated.
+    pub fn allocate_new() -> Result<PageBox<Self>, SvsmError> {
+        let mut pgtable: PageBox<Self> = PageBox::try_new_zeroed()?;
+        let paddr = virt_to_phys(pgtable.vaddr());
+
+        // Set the self-map entry.
+        let entry = &mut pgtable.root[PGTABLE_LVL3_IDX_PTE_SELFMAP];
+        let flags = PTEntryFlags::PRESENT
+            | PTEntryFlags::WRITABLE
+            | PTEntryFlags::ACCESSED
+            | PTEntryFlags::DIRTY
+            | PTEntryFlags::NX;
+        entry.set(make_private_address(paddr), flags);
+
+        Ok(pgtable)
     }
 
     /// Clone the shared part of the page table; excluding the private
@@ -432,16 +586,15 @@ impl PageTable {
     ///
     /// # Errors
     /// Returns [`SvsmError`] if the page cannot be allocated.
-    pub fn clone_shared(&self) -> Result<PageTable, SvsmError> {
+    pub fn clone_shared(&self) -> Result<PageBox<PageTable>, SvsmError> {
         let mut pgtable = Self::allocate_new()?;
-        pgtable.root_mut().entries[PGTABLE_LVL3_IDX_SHARED] =
-            self.root().entries[PGTABLE_LVL3_IDX_SHARED];
+        pgtable.root.entries[PGTABLE_LVL3_IDX_SHARED] = self.root.entries[PGTABLE_LVL3_IDX_SHARED];
         Ok(pgtable)
     }
 
     /// Copy an entry `entry` from another [`PageTable`].
     pub fn copy_entry(&mut self, other: &Self, entry: usize) {
-        self.root_mut().entries[entry] = other.root().entries[entry];
+        self.root.entries[entry] = other.root.entries[entry];
     }
 
     /// Computes the index within a page table at the given level for a
@@ -457,8 +610,80 @@ impl PageTable {
         //vaddr.bits() >> (12 + L * 9) & 0x1ff
     }
 
-    // The page-table walk (`walk_addr`, `walk_addr_lvl0/1/2/3`) is verified and
-    // permission-threaded; see the `verus!` block at the end of this file.
+    /// Walks a page table at level 0 to find a mapping.
+    ///
+    /// # Parameters
+    /// - `page`: A mutable reference to the root page table.
+    /// - `vaddr`: The virtual address to find a mapping for.
+    ///
+    /// # Returns
+    /// A `Mapping` representing the found mapping.
+    fn walk_addr_lvl0(page: &mut PTPage, vaddr: VirtAddr) -> Mapping<'_> {
+        let idx = Self::index::<0>(vaddr);
+        Mapping::Level0(&mut page[idx])
+    }
+
+    /// Walks a page table at level 1 to find a mapping.
+    ///
+    /// # Parameters
+    /// - `page`: A mutable reference to the root page table.
+    /// - `vaddr`: The virtual address to find a mapping for.
+    ///
+    /// # Returns
+    /// A `Mapping` representing the found mapping.
+    fn walk_addr_lvl1(page: &mut PTPage, vaddr: VirtAddr) -> Mapping<'_> {
+        let idx = Self::index::<1>(vaddr);
+        let entry = page[idx];
+        match PTPage::from_entry(entry) {
+            Some(page) => Self::walk_addr_lvl0(page, vaddr),
+            None => Mapping::Level1(&mut page[idx]),
+        }
+    }
+
+    /// Walks a page table at level 2 to find a mapping.
+    ///
+    /// # Parameters
+    /// - `page`: A mutable reference to the root page table.
+    /// - `vaddr`: The virtual address to find a mapping for.
+    ///
+    /// # Returns
+    /// A `Mapping` representing the found mapping.
+    fn walk_addr_lvl2(page: &mut PTPage, vaddr: VirtAddr) -> Mapping<'_> {
+        let idx = Self::index::<2>(vaddr);
+        let entry = page[idx];
+        match PTPage::from_entry(entry) {
+            Some(page) => Self::walk_addr_lvl1(page, vaddr),
+            None => Mapping::Level2(&mut page[idx]),
+        }
+    }
+
+    /// Walks the page table to find a mapping for a given virtual address.
+    ///
+    /// # Parameters
+    /// - `page`: A mutable reference to the root page table.
+    /// - `vaddr`: The virtual address to find a mapping for.
+    ///
+    /// # Returns
+    /// A `Mapping` representing the found mapping.
+    fn walk_addr_lvl3(page: &mut PTPage, vaddr: VirtAddr) -> Mapping<'_> {
+        let idx = Self::index::<3>(vaddr);
+        let entry = page[idx];
+        match PTPage::from_entry(entry) {
+            Some(page) => Self::walk_addr_lvl2(page, vaddr),
+            None => Mapping::Level3(&mut page[idx]),
+        }
+    }
+
+    /// Walk the virtual address and return the corresponding mapping.
+    ///
+    /// # Parameters
+    /// - `vaddr`: The virtual address to find a mapping for.
+    ///
+    /// # Returns
+    /// A `Mapping` representing the found mapping.
+    fn walk_addr(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
+        Self::walk_addr_lvl3(&mut self.root, vaddr)
+    }
 
     /// Calculate the virtual address of a PTE in the self-map, which maps a
     /// specified virtual address.
@@ -480,10 +705,6 @@ impl PageTable {
     /// # Returns
     /// Some(PageFrame) if the virtual address is valid.
     /// None if the virtual address is not valid.
-    ///
-    /// Under verification this method is replaced by a verified version that
-    /// threads the self-map evidence (`SelfMapView`); see the `verus!` block at
-    /// the end of this file. The control flow is identical.
     pub fn virt_to_frame(vaddr: VirtAddr) -> Option<PageFrame> {
         // Calculate the virtual addresses of each level of the paging
         // hierarchy in the self-map.
@@ -540,9 +761,104 @@ impl PageTable {
         }
     }
 
-    // The allocate-on-walk helpers (`alloc_pte_4k`, `alloc_pte_2m`,
-    // `alloc_pte_lvl1/2/3`) are verified and permission-threaded; see the
-    // `verus!` block at the end of this file.
+    fn alloc_pte_lvl3(entry: &mut PTEntry, vaddr: VirtAddr, size: PageSize) -> Mapping<'_> {
+        let flags = entry.flags();
+
+        if flags.contains(PTEntryFlags::PRESENT) {
+            return Mapping::Level3(entry);
+        }
+
+        let Ok((page, paddr)) = PTPage::alloc() else {
+            return Mapping::Level3(entry);
+        };
+
+        let flags = PTEntryFlags::PRESENT
+            | PTEntryFlags::WRITABLE
+            | PTEntryFlags::USER
+            | PTEntryFlags::ACCESSED;
+        entry.set(make_private_address(paddr), flags);
+
+        let idx = Self::index::<2>(vaddr);
+        Self::alloc_pte_lvl2(&mut page[idx], vaddr, size)
+    }
+
+    fn alloc_pte_lvl2(entry: &mut PTEntry, vaddr: VirtAddr, size: PageSize) -> Mapping<'_> {
+        let flags = entry.flags();
+
+        if flags.contains(PTEntryFlags::PRESENT) {
+            return Mapping::Level2(entry);
+        }
+
+        let Ok((page, paddr)) = PTPage::alloc() else {
+            return Mapping::Level2(entry);
+        };
+
+        let flags = PTEntryFlags::PRESENT
+            | PTEntryFlags::WRITABLE
+            | PTEntryFlags::USER
+            | PTEntryFlags::ACCESSED;
+        entry.set(make_private_address(paddr), flags);
+
+        let idx = Self::index::<1>(vaddr);
+        Self::alloc_pte_lvl1(&mut page[idx], vaddr, size)
+    }
+
+    fn alloc_pte_lvl1(entry: &mut PTEntry, vaddr: VirtAddr, size: PageSize) -> Mapping<'_> {
+        let flags = entry.flags();
+
+        if size == PageSize::Huge || flags.contains(PTEntryFlags::PRESENT) {
+            return Mapping::Level1(entry);
+        }
+
+        let Ok((page, paddr)) = PTPage::alloc() else {
+            return Mapping::Level1(entry);
+        };
+
+        let flags = PTEntryFlags::PRESENT
+            | PTEntryFlags::WRITABLE
+            | PTEntryFlags::USER
+            | PTEntryFlags::ACCESSED;
+        entry.set(make_private_address(paddr), flags);
+
+        let idx = Self::index::<0>(vaddr);
+        Mapping::Level0(&mut page[idx])
+    }
+
+    /// Allocates a 4KB page table entry for a given virtual address.
+    ///
+    /// # Parameters
+    /// - `vaddr`: The virtual address for which to allocate the PTE.
+    ///
+    /// # Returns
+    /// A `Mapping` representing the allocated or existing PTE for the address.
+    fn alloc_pte_4k(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
+        let m = self.walk_addr(vaddr);
+
+        match m {
+            Mapping::Level0(entry) => Mapping::Level0(entry),
+            Mapping::Level1(entry) => Self::alloc_pte_lvl1(entry, vaddr, PageSize::Regular),
+            Mapping::Level2(entry) => Self::alloc_pte_lvl2(entry, vaddr, PageSize::Regular),
+            Mapping::Level3(entry) => Self::alloc_pte_lvl3(entry, vaddr, PageSize::Regular),
+        }
+    }
+
+    /// Allocates a 2MB page table entry for a given virtual address.
+    ///
+    /// # Parameters
+    /// - `vaddr`: The virtual address for which to allocate the PTE.
+    ///
+    /// # Returns
+    /// A `Mapping` representing the allocated or existing PTE for the address.
+    fn alloc_pte_2m(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
+        let m = self.walk_addr(vaddr);
+
+        match m {
+            Mapping::Level0(entry) => Mapping::Level0(entry),
+            Mapping::Level1(entry) => Mapping::Level1(entry),
+            Mapping::Level2(entry) => Self::alloc_pte_lvl2(entry, vaddr, PageSize::Huge),
+            Mapping::Level3(entry) => Self::alloc_pte_lvl3(entry, vaddr, PageSize::Huge),
+        }
+    }
 
     /// Splits a 2MB page into 4KB pages.
     ///
@@ -582,16 +898,12 @@ impl PageTable {
     ///
     /// # Returns
     /// A result indicating success or an error [`SvsmError`].
-    fn split_4k(mapping: Mapping) -> Result<(), SvsmError> {
+    fn split_4k(mapping: Mapping<'_>) -> Result<(), SvsmError> {
         match mapping {
-            Mapping::Level0(_loc) => Ok(()),
-            Mapping::Level1(loc) => {
-                // SAFETY: `loc` was produced by the verified walk.
-                let entry = unsafe { loc_entry_mut(&loc) };
-                Self::do_split_4k(entry)
-            }
-            Mapping::Level2(_loc) => Err(SvsmError::Mem),
-            Mapping::Level3(_loc) => Err(SvsmError::Mem),
+            Mapping::Level0(_entry) => Ok(()),
+            Mapping::Level1(entry) => Self::do_split_4k(entry),
+            Mapping::Level2(_entry) => Err(SvsmError::Mem),
+            Mapping::Level3(_entry) => Err(SvsmError::Mem),
         }
     }
 
@@ -623,9 +935,7 @@ impl PageTable {
         let mapping = self.walk_addr(vaddr);
         Self::split_4k(mapping)?;
 
-        if let Mapping::Level0(loc) = self.walk_addr(vaddr) {
-            // SAFETY: `loc` was produced by the verified walk.
-            let entry = unsafe { loc_entry_mut(&loc) };
+        if let Mapping::Level0(entry) = self.walk_addr(vaddr) {
             Self::make_pte_shared(entry);
             Ok(())
         } else {
@@ -644,9 +954,7 @@ impl PageTable {
         let mapping = self.walk_addr(vaddr);
         Self::split_4k(mapping)?;
 
-        if let Mapping::Level0(loc) = self.walk_addr(vaddr) {
-            // SAFETY: `loc` was produced by the verified walk.
-            let entry = unsafe { loc_entry_mut(&loc) };
+        if let Mapping::Level0(entry) = self.walk_addr(vaddr) {
             Self::make_pte_private(entry);
             Ok(())
         } else {
@@ -658,24 +966,116 @@ impl PageTable {
     /// no such mapping exists.
     pub fn check_mapping(&mut self, vaddr: VirtAddr) -> Option<PhysAddr> {
         match self.walk_addr(vaddr) {
-            Mapping::Level0(loc) | Mapping::Level1(loc) => {
-                // SAFETY: `loc` was produced by the verified walk.
-                Some(unsafe { loc_entry_mut(&loc) }.address())
-            }
+            Mapping::Level0(entry) => Some(entry.address()),
+            Mapping::Level1(entry) => Some(entry.address()),
             _ => None,
         }
     }
 
-    /// Maps a 2MB page. Verified; see the `verus!` block at the end of this
-    /// file for `map_2m`/`unmap_2m`.
-    //
-    // moved into the verus! block
+    /// Maps a 2MB page.
+    ///
+    /// # Parameters
+    /// - `vaddr`: The virtual address to map.
+    /// - `paddr`: The physical address to map to.
+    /// - `flags`: The flags to apply to the mapping.
+    /// - `shared`: Indicates whether the mapping is shared.
+    ///
+    /// # Returns
+    /// A result indicating success or failure ([`SvsmError`]).
+    ///
+    /// # Panics
+    /// Panics if either `vaddr` or `paddr` is not aligned to a 2MB boundary.
+    pub fn map_2m(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        flags: PTEntryFlags,
+        shared: bool,
+    ) -> Result<(), SvsmError> {
+        assert!(vaddr.is_aligned(PAGE_SIZE_2M));
+        assert!(paddr.is_aligned(PAGE_SIZE_2M));
 
-    /// Maps a 4KB page. Verified; see the `verus!` block at the end of this
-    /// file.
+        let mapping = self.alloc_pte_2m(vaddr);
+        let addr = if !shared {
+            make_private_address(paddr)
+        } else {
+            make_shared_address(paddr)
+        };
 
-    /// Unmaps a 4KB page. Verified; see the `verus!` block at the end of this
-    /// file.
+        if let Mapping::Level1(entry) = mapping {
+            entry.set(addr, flags | PTEntryFlags::HUGE);
+            Ok(())
+        } else {
+            Err(SvsmError::Mem)
+        }
+    }
+
+    /// Unmaps a 2MB page.
+    ///
+    /// # Parameters
+    /// - `vaddr`: The virtual address of the mapping to unmap.
+    ///
+    /// # Panics
+    /// Panics if `vaddr` is not aligned to a 2MB boundary.
+    pub fn unmap_2m(&mut self, vaddr: VirtAddr) {
+        assert!(vaddr.is_aligned(PAGE_SIZE_2M));
+
+        let mapping = self.walk_addr(vaddr);
+
+        match mapping {
+            Mapping::Level0(_) => unreachable!(),
+            Mapping::Level1(entry) => entry.clear(),
+            Mapping::Level2(entry) => assert!(!entry.present()),
+            Mapping::Level3(entry) => assert!(!entry.present()),
+        }
+    }
+
+    /// Maps a 4KB page.
+    ///
+    /// # Parameters
+    /// - `vaddr`: The virtual address to map.
+    /// - `paddr`: The physical address to map to.
+    /// - `flags`: The flags to apply to the mapping.
+    /// - `shared`: Indicates whether the mapping is shared.
+    ///
+    /// # Returns
+    /// A result indicating success or failure ([`SvsmError`]).
+    pub fn map_4k(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        flags: PTEntryFlags,
+        shared: bool,
+    ) -> Result<(), SvsmError> {
+        let mapping = self.alloc_pte_4k(vaddr);
+        let addr = if !shared {
+            make_private_address(paddr)
+        } else {
+            make_shared_address(paddr)
+        };
+
+        if let Mapping::Level0(entry) = mapping {
+            entry.set(addr, flags);
+            Ok(())
+        } else {
+            Err(SvsmError::Mem)
+        }
+    }
+
+    /// Unmaps a 4KB page.
+    ///
+    /// # Parameters
+    /// - `vaddr`: The virtual address of the mapping to unmap.
+    pub fn unmap_4k(&mut self, vaddr: VirtAddr) {
+        let mapping = self.walk_addr(vaddr);
+
+        match mapping {
+            Mapping::Level0(entry) => entry.clear(),
+            Mapping::Level1(entry) => assert!(!entry.present()),
+            Mapping::Level2(entry) => assert!(!entry.present()),
+            Mapping::Level3(entry) => assert!(!entry.present()),
+        }
+    }
 
     /// Retrieves the physical address of a mapping.
     ///
@@ -689,18 +1089,14 @@ impl PageTable {
         let mapping = self.walk_addr(vaddr);
 
         match mapping {
-            Mapping::Level0(loc) => {
-                // SAFETY: `loc` was produced by the verified walk.
-                let entry = unsafe { loc_entry_mut(&loc) };
+            Mapping::Level0(entry) => {
                 let offset = vaddr.page_offset();
                 if !entry.flags().contains(PTEntryFlags::PRESENT) {
                     return Err(SvsmError::Mem);
                 }
                 Ok(entry.address() + offset)
             }
-            Mapping::Level1(loc) => {
-                // SAFETY: `loc` was produced by the verified walk.
-                let entry = unsafe { loc_entry_mut(&loc) };
+            Mapping::Level1(entry) => {
                 let offset = vaddr.bits() & (PAGE_SIZE_2M - 1);
                 if !entry.flags().contains(PTEntryFlags::PRESENT)
                     || !entry.flags().contains(PTEntryFlags::HUGE)
@@ -710,8 +1106,8 @@ impl PageTable {
 
                 Ok(entry.address() + offset)
             }
-            Mapping::Level2(_loc) => Err(SvsmError::Mem),
-            Mapping::Level3(_loc) => Err(SvsmError::Mem),
+            Mapping::Level2(_entry) => Err(SvsmError::Mem),
+            Mapping::Level3(_entry) => Err(SvsmError::Mem),
         }
     }
 
@@ -828,14 +1224,12 @@ impl PageTable {
             let mapping = self.walk_addr(vaddr);
 
             match mapping {
-                Mapping::Level0(loc) => {
-                    // SAFETY: `loc` was produced by the verified walk.
-                    unsafe { loc_entry_mut(&loc) }.clear();
+                Mapping::Level0(entry) => {
+                    entry.clear();
                     vaddr = vaddr + PAGE_SIZE;
                 }
-                Mapping::Level1(loc) => {
-                    // SAFETY: `loc` was produced by the verified walk.
-                    unsafe { loc_entry_mut(&loc) }.clear();
+                Mapping::Level1(entry) => {
+                    entry.clear();
                     vaddr = vaddr + PAGE_SIZE_2M;
                 }
                 _ => {
@@ -858,7 +1252,7 @@ impl PageTable {
             | PTEntryFlags::WRITABLE
             | PTEntryFlags::USER
             | PTEntryFlags::ACCESSED;
-        let entry = &mut self.root_mut()[idx];
+        let entry = &mut self.root[idx];
         let prev = entry.raw();
         entry.set(make_private_address(paddr), flags);
         prev != entry.raw()
@@ -880,9 +1274,7 @@ impl PageTable {
     ) -> Result<(), SvsmError> {
         for page in region.iter_pages(PageSize::Regular) {
             match self.walk_addr(page) {
-                Mapping::Level0(loc) => {
-                    // SAFETY: `loc` was produced by the verified walk.
-                    let entry = unsafe { loc_entry_mut(&loc) };
+                Mapping::Level0(entry) => {
                     if !entry.present() || !entry.global() {
                         return Err(SvsmError::Mem);
                     }
@@ -897,10 +1289,9 @@ impl PageTable {
 
                     entry.set(paddr, flags);
                 }
-                Mapping::Level1(loc) | Mapping::Level2(loc) => {
+                Mapping::Level1(entry) | Mapping::Level2(entry) => {
                     // Ensure we never fell on a huge page while iterating over the region pages.
-                    // SAFETY: `loc` was produced by the verified walk.
-                    if unsafe { loc_entry_mut(&loc) }.huge() {
+                    if entry.huge() {
                         return Err(SvsmError::Mem);
                     }
                 }
@@ -909,17 +1300,6 @@ impl PageTable {
         }
 
         Ok(())
-    }
-}
-
-impl Drop for PageTable {
-    fn drop(&mut self) {
-        // SAFETY: `root` is the access handle for the root page owned by this
-        // `PageTable`; it was allocated by the page allocator in `allocate_new`.
-        unsafe {
-            let ptr = NonNull::new_unchecked(self.root.pptr.addr as *mut PTPage);
-            let _ = PageBox::from_raw(ptr);
-        }
     }
 }
 
@@ -972,79 +1352,9 @@ impl RawPageTablePart {
     /// - `vaddr`: The virtual address to find the mapping for.
     ///
     /// # Returns
-    /// The [`RawMapping`] for the given virtual address.
-    fn walk_addr(&mut self, vaddr: VirtAddr) -> RawMapping<'_> {
-        Self::walk_addr_lvl2(&mut self.page, vaddr)
-    }
-
-    // Raw, borrow-based walk/alloc helpers for the untracked subtree. These are
-    // the original `&mut PTPage`/`&mut PTEntry` operations; the [`PageTable`]
-    // versions are now verified and permission-threaded, so the subtree keeps
-    // its own copies here.
-
-    fn walk_addr_lvl0(page: &mut PTPage, vaddr: VirtAddr) -> RawMapping<'_> {
-        let idx = PageTable::index::<0>(vaddr);
-        RawMapping::Level0(&mut page[idx])
-    }
-
-    fn walk_addr_lvl1(page: &mut PTPage, vaddr: VirtAddr) -> RawMapping<'_> {
-        let idx = PageTable::index::<1>(vaddr);
-        let entry = page[idx];
-        match PTPage::from_entry(entry) {
-            Some(page) => Self::walk_addr_lvl0(page, vaddr),
-            None => RawMapping::Level1(&mut page[idx]),
-        }
-    }
-
-    fn walk_addr_lvl2(page: &mut PTPage, vaddr: VirtAddr) -> RawMapping<'_> {
-        let idx = PageTable::index::<2>(vaddr);
-        let entry = page[idx];
-        match PTPage::from_entry(entry) {
-            Some(page) => Self::walk_addr_lvl1(page, vaddr),
-            None => RawMapping::Level2(&mut page[idx]),
-        }
-    }
-
-    fn alloc_pte_lvl2(entry: &mut PTEntry, vaddr: VirtAddr, size: PageSize) -> RawMapping<'_> {
-        let flags = entry.flags();
-
-        if flags.contains(PTEntryFlags::PRESENT) {
-            return RawMapping::Level2(entry);
-        }
-
-        let Ok((page, paddr)) = PTPage::alloc() else {
-            return RawMapping::Level2(entry);
-        };
-
-        let flags = PTEntryFlags::PRESENT
-            | PTEntryFlags::WRITABLE
-            | PTEntryFlags::USER
-            | PTEntryFlags::ACCESSED;
-        entry.set(make_private_address(paddr), flags);
-
-        let idx = PageTable::index::<1>(vaddr);
-        Self::alloc_pte_lvl1(&mut page[idx], vaddr, size)
-    }
-
-    fn alloc_pte_lvl1(entry: &mut PTEntry, vaddr: VirtAddr, size: PageSize) -> RawMapping<'_> {
-        let flags = entry.flags();
-
-        if size == PageSize::Huge || flags.contains(PTEntryFlags::PRESENT) {
-            return RawMapping::Level1(entry);
-        }
-
-        let Ok((page, paddr)) = PTPage::alloc() else {
-            return RawMapping::Level1(entry);
-        };
-
-        let flags = PTEntryFlags::PRESENT
-            | PTEntryFlags::WRITABLE
-            | PTEntryFlags::USER
-            | PTEntryFlags::ACCESSED;
-        entry.set(make_private_address(paddr), flags);
-
-        let idx = PageTable::index::<0>(vaddr);
-        RawMapping::Level0(&mut page[idx])
+    /// The [`Mapping`] for the given virtual address.
+    fn walk_addr(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
+        PageTable::walk_addr_lvl2(&mut self.page, vaddr)
     }
 
     /// Allocates a 4KB page table entry for a given virtual address.
@@ -1053,18 +1363,18 @@ impl RawPageTablePart {
     /// - `vaddr`: The virtual address for which to allocate the PTE.
     ///
     /// # Returns
-    /// The [`RawMapping`] representing the allocated or existing PTE for the address.
+    /// The [`Mapping`] representing the allocated or existing PTE for the address.
     ///
     /// # Panics
     /// Panics if a level 3 mapping is attempted in a [`RawPageTablePart`].
-    fn alloc_pte_4k(&mut self, vaddr: VirtAddr) -> RawMapping<'_> {
+    fn alloc_pte_4k(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
         let m = self.walk_addr(vaddr);
 
         match m {
-            RawMapping::Level0(entry) => RawMapping::Level0(entry),
-            RawMapping::Level1(entry) => Self::alloc_pte_lvl1(entry, vaddr, PageSize::Regular),
-            RawMapping::Level2(entry) => Self::alloc_pte_lvl2(entry, vaddr, PageSize::Regular),
-            RawMapping::Level3(_) => panic!("PT level 3 not possible in PageTablePart"),
+            Mapping::Level0(entry) => Mapping::Level0(entry),
+            Mapping::Level1(entry) => PageTable::alloc_pte_lvl1(entry, vaddr, PageSize::Regular),
+            Mapping::Level2(entry) => PageTable::alloc_pte_lvl2(entry, vaddr, PageSize::Regular),
+            Mapping::Level3(_) => panic!("PT level 3 not possible in PageTablePart"),
         }
     }
 
@@ -1074,16 +1384,16 @@ impl RawPageTablePart {
     /// - `vaddr`: The virtual address for which to allocate the PTE.
     ///
     /// # Returns
-    /// The [`RawMapping`] representing the allocated or existing PTE for the
+    /// The [`Mapping`] representing the allocated or existing PTE for the
     /// address.
-    fn alloc_pte_2m(&mut self, vaddr: VirtAddr) -> RawMapping<'_> {
+    fn alloc_pte_2m(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
         let m = self.walk_addr(vaddr);
 
         match m {
-            RawMapping::Level0(entry) => RawMapping::Level0(entry),
-            RawMapping::Level1(entry) => RawMapping::Level1(entry),
-            RawMapping::Level2(entry) => Self::alloc_pte_lvl2(entry, vaddr, PageSize::Huge),
-            RawMapping::Level3(entry) => RawMapping::Level2(entry),
+            Mapping::Level0(entry) => Mapping::Level0(entry),
+            Mapping::Level1(entry) => Mapping::Level1(entry),
+            Mapping::Level2(entry) => PageTable::alloc_pte_lvl2(entry, vaddr, PageSize::Huge),
+            Mapping::Level3(entry) => PageTable::alloc_pte_lvl3(entry, vaddr, PageSize::Huge),
         }
     }
 
@@ -1112,7 +1422,7 @@ impl RawPageTablePart {
             make_shared_address(paddr)
         };
 
-        if let RawMapping::Level0(entry) = mapping {
+        if let Mapping::Level0(entry) = mapping {
             entry.set(addr, flags);
             Ok(())
         } else {
@@ -1131,20 +1441,20 @@ impl RawPageTablePart {
         let mapping = self.walk_addr(vaddr);
 
         match mapping {
-            RawMapping::Level0(entry) => {
+            Mapping::Level0(entry) => {
                 let e = *entry;
                 entry.clear();
                 Some(e)
             }
-            RawMapping::Level1(entry) => {
+            Mapping::Level1(entry) => {
                 assert!(!entry.present());
                 None
             }
-            RawMapping::Level2(entry) => {
+            Mapping::Level2(entry) => {
                 assert!(!entry.present());
                 None
             }
-            RawMapping::Level3(entry) => {
+            Mapping::Level3(entry) => {
                 assert!(!entry.present());
                 None
             }
@@ -1182,7 +1492,7 @@ impl RawPageTablePart {
             make_shared_address(paddr)
         };
 
-        if let RawMapping::Level1(entry) = mapping {
+        if let Mapping::Level1(entry) = mapping {
             entry.set(addr, flags | PTEntryFlags::HUGE);
             Ok(())
         } else {
@@ -1207,16 +1517,16 @@ impl RawPageTablePart {
         let mapping = self.walk_addr(vaddr);
 
         match mapping {
-            RawMapping::Level0(_) => None,
-            RawMapping::Level1(entry) => {
+            Mapping::Level0(_) => None,
+            Mapping::Level1(entry) => {
                 entry.clear();
                 Some(*entry)
             }
-            RawMapping::Level2(entry) => {
+            Mapping::Level2(entry) => {
                 assert!(!entry.present());
                 None
             }
-            RawMapping::Level3(entry) => {
+            Mapping::Level3(entry) => {
                 assert!(!entry.present());
                 None
             }
@@ -1393,459 +1703,227 @@ impl PageTablePart {
     }
 }
 
-// =====================================================================
-// Verified page-table root: storage, allocation, and 4K map/unmap.
-//
-// The struct stores only the access handle `root` (a direct-map pointer); the
-// real authority over every page-table page lives in the tracked `perms`. The
-// invariant `inv()` anchors `root` to the permission map and asserts the map is
-// well-formed. `map_4k`/`unmap_4k` thread `perms` through the trusted memory API
-// in `specs.rs`, so no page-table `unsafe` appears here.
-// =====================================================================
-#[cfg(verus_only)]
-verus! {
-
-#[allow(missing_debug_implementations)]
-pub struct PageTable {
-    pub root: PTPagePtr,
-    pub perms: Tracked<PageTablePerms>,
-}
-
-/// A location-based page-table entry slot: the access handle and (ghost) PFN of
-/// the node together with the entry index. This replaces the original
-/// borrow-based `&mut PTEntry` mapping for the verified `PageTable`, so that a
-/// slot can be tied back to the root permission map (`perms.pages()[node@]`) and
-/// written through the trusted memory API.
-#[allow(missing_debug_implementations)]
-pub struct PTLoc {
-    pub ptr: PTPagePtr,
-    pub node: Ghost<PFN>,
-    pub idx: usize,
-}
-
-/// Location-based mapping levels, tagged by the level of the node holding the
-/// entry. The verified `walk_addr`/`alloc_pte_*` helpers return these.
-#[allow(missing_debug_implementations)]
-pub enum Mapping {
-    Level3(PTLoc),
-    Level2(PTLoc),
-    Level1(PTLoc),
-    Level0(PTLoc),
-}
-
-/// A slot `loc` denotes a live entry at paging `lvl` in the permission map.
-pub open spec fn loc_at(loc: PTLoc, perms: PageTablePerms, lvl: nat) -> bool {
-    &&& perms.pages().dom().contains(loc.node@)
-    &&& loc.ptr.addr() == perms.pages()[loc.node@].pptr().addr()
-    &&& perms.pages()[loc.node@].level() == lvl
-    &&& loc.idx < 512
-}
-
-/// A mapping's slot is live at the level indicated by its tag.
-pub open spec fn mapping_ok(m: Mapping, perms: PageTablePerms) -> bool {
-    match m {
-        Mapping::Level3(loc) => loc_at(loc, perms, 3),
-        Mapping::Level2(loc) => loc_at(loc, perms, 2),
-        Mapping::Level1(loc) => loc_at(loc, perms, 1),
-        Mapping::Level0(loc) => loc_at(loc, perms, 0),
+bitflags! {
+    /// Flags to represent how memory is accessed, e.g. write data to the
+    /// memory or fetch code from the memory.
+    #[derive(Clone, Copy, Debug)]
+    pub struct MemAccessMode: u32 {
+        const WRITE     = 1 << 0;
+        const FETCH     = 1 << 1;
     }
 }
 
-impl PageTable {
-    /// Root-owned well-formedness: the permission map is consistent and the
-    /// stored access handle points at the root node it tracks.
-    pub open spec fn inv(self) -> bool {
-        &&& self.perms@.wf()
-        &&& self.root.addr() == self.perms@.root_pptr().addr()
+/// Attributes to determin Whether a memory access (write/fetch) is permitted
+/// by a translation which includes the paging-mode modifiers in CR0, CR4 and
+/// EFER; EFLAGS.AC; and the supervisor/user mode access.
+#[derive(Clone, Copy, Debug)]
+pub struct PTWalkAttr {
+    cr0: CR0Flags,
+    cr4: CR4Flags,
+    efer: EFERFlags,
+    flags: RFlags,
+    user_mode_access: bool,
+    pm: PagingMode,
+}
+
+impl PTWalkAttr {
+    /// Creates a new `PTWalkAttr` instance with the specified attributes.
+    ///
+    /// # Arguments
+    ///
+    /// * `cr0`, `cr4`, and `efer` - Represent the control register
+    ///   flags for CR0, CR4, and EFER respectively.
+    /// * `flags` - Represents the CPU Flags.
+    /// * `user_mode_access` - Indicates whether the access is in user mode.
+    ///
+    /// Returns a new `PTWalkAttr` instance.
+    pub fn new(
+        cr0: CR0Flags,
+        cr4: CR4Flags,
+        efer: EFERFlags,
+        flags: RFlags,
+        user_mode_access: bool,
+    ) -> Self {
+        Self {
+            cr0,
+            cr4,
+            efer,
+            flags,
+            user_mode_access,
+            pm: PagingMode::new(efer, cr0, cr4),
+        }
     }
 
-    /// Allocate a new page-table root.
-    pub fn allocate_new() -> (r: Result<PageTable, SvsmError>)
-        ensures
-            r matches Ok(pt) ==> pt.inv(),
-    {
-        let (root, _pfn, perms) = match pt_root_alloc() {
-            Ok(t) => t,
-            Err(e) => return Err(e),
-        };
-        let pt = PageTable { root, perms };
-        Ok(pt)
-    }
+    /// Checks the access rights for a page table entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The page table entry to check.
+    /// * `mem_am` - Indicates how to access the memory.
+    /// * `last_level` - Indicates whether the entry is at the last level
+    ///   of the page table.
+    /// * `pteflags` - The PTE flags to indicate if the corresponding page
+    ///   table entry allows the access rights.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok((entry, leaf))` if the access rights are valid, where
+    /// `entry` is the modified page table entry and `leaf` is a boolean
+    /// indicating whether the entry is a leaf node, or `Err(PageFaultError)`
+    /// to indicate the page fault error code if the access rights are invalid.
+    pub fn check_access_rights(
+        &self,
+        entry: PTEntry,
+        mem_am: MemAccessMode,
+        level: usize,
+        pteflags: &mut PTEntryFlags,
+    ) -> Result<(PTEntry, bool), PageFaultError> {
+        let pf_err = self.default_pf_err(mem_am) | PageFaultError::P;
 
-    // =================================================================
-    // Verified walk: locate the slot for `vaddr`, descending through
-    // existing interior tables. Mirrors the original recursive
-    // `walk_addr_lvl3 -> lvl2 -> lvl1 -> lvl0`, but threads the root
-    // permission map and returns a location-based `Mapping`.
-    // =================================================================
+        if !entry.present() {
+            // Entry is not present.
+            return Err(pf_err & !PageFaultError::P);
+        }
 
-    /// Level-0 node: the slot is always the final 4K leaf slot.
-    fn walk_addr_lvl0(&self, node_ptr: PTPagePtr, Ghost(node_pfn): Ghost<PFN>, vaddr: VirtAddr)
-        -> (r: Mapping)
-        requires
-            self.perms@.wf(),
-            self.perms@.pages().dom().contains(node_pfn),
-            node_ptr.addr() == self.perms@.pages()[node_pfn].pptr().addr(),
-            self.perms@.pages()[node_pfn].level() == 0,
-        ensures
-            mapping_ok(r, self.perms@),
-    {
-        let idx = pt_index_exec(vaddr, 0);
-        Mapping::Level0(PTLoc { ptr: node_ptr, node: Ghost(node_pfn), idx })
-    }
+        if entry.has_reserved_bits(self.pm, level) {
+            // Reserved bits have been set.
+            return Err(pf_err | PageFaultError::R);
+        }
 
-    /// Level-1 node: descend into the level-0 child if present, else stop here.
-    fn walk_addr_lvl1(&self, node_ptr: PTPagePtr, Ghost(node_pfn): Ghost<PFN>, vaddr: VirtAddr)
-        -> (r: Mapping)
-        requires
-            self.perms@.wf(),
-            self.perms@.pages().dom().contains(node_pfn),
-            node_ptr.addr() == self.perms@.pages()[node_pfn].pptr().addr(),
-            self.perms@.pages()[node_pfn].level() == 1,
-        ensures
-            mapping_ok(r, self.perms@),
-    {
-        let idx = pt_index_exec(vaddr, 1);
-        let e = pt_read_entry(&node_ptr, Ghost(node_pfn), idx, Tracked(self.perms.borrow()));
-        if entry_present(e) && !entry_huge(e) {
-            assert(node_pfn != self.perms@.root());
-            proof {
-                lemma_interior_child_level(self.perms@, node_pfn, idx as nat, pte_decode(e));
+        // SDM 4.6.1 Determination of Access Rights:
+        // If the U/S flag (bit 2) is 0 in at least one of the
+        // paging-structure entries, the address is a supervisor-mode
+        // address. Otherwise, the address is a user-mode address.
+        // So by-default assume the address is user mode address.
+        if !entry.user() {
+            *pteflags &= !PTEntryFlags::USER;
+        }
+
+        // SDM 4.6.1 Determination of Access Rights:
+        // R/W flag (bit 1) is 1 in every paging-structure entry controlling
+        // the translation and with a protection key for which write access is
+        // permitted; data may not be written to any supervisor-mode
+        // address with a translation for which the R/W flag is 0 in any
+        // paging-structure entry controlling the translation.
+        // The same for user mode address
+        if !entry.writable() {
+            *pteflags &= !PTEntryFlags::WRITABLE;
+        }
+
+        // SDM 4.6.1 Determination of Access Rights:
+        // For non 32-bit paging modes with IA32_EFER.NXE = 1, instructions
+        // may be fetched from any supervisormode address with a translation
+        // for which the XD flag (bit 63) is 0 in every paging-structure entry
+        // controlling the translation; instructions may not be fetched from
+        // any supervisor-mode address with a translation for which the XD flag
+        // is 1 in any paging-structure entry controlling the translation
+        if self.efer.contains(EFERFlags::NXE) && entry.nx() {
+            *pteflags |= PTEntryFlags::NX;
+        } else if !self.efer.contains(EFERFlags::NXE) && entry.nx() {
+            // XD bit must be 0 if efer.NXE = 0
+            return Err(pf_err | PageFaultError::R);
+        }
+
+        let leaf = if level == 0 || entry.huge() {
+            // User mode cannot access any supervisor mode addresses
+            if self.user_mode_access && !pteflags.contains(PTEntryFlags::USER) {
+                return Err(pf_err);
             }
-            let cptr = entry_child(e, Tracked(self.perms.borrow()));
-            let cpfn = Ghost(pte_decode(e).target);
-            self.walk_addr_lvl0(cptr, cpfn, vaddr)
-        } else {
-            Mapping::Level1(PTLoc { ptr: node_ptr, node: Ghost(node_pfn), idx })
-        }
-    }
 
-    /// Level-2 node: descend into the level-1 child if present, else stop here.
-    fn walk_addr_lvl2(&self, node_ptr: PTPagePtr, Ghost(node_pfn): Ghost<PFN>, vaddr: VirtAddr)
-        -> (r: Mapping)
-        requires
-            self.perms@.wf(),
-            self.perms@.pages().dom().contains(node_pfn),
-            node_ptr.addr() == self.perms@.pages()[node_pfn].pptr().addr(),
-            self.perms@.pages()[node_pfn].level() == 2,
-        ensures
-            mapping_ok(r, self.perms@),
-    {
-        let idx = pt_index_exec(vaddr, 2);
-        let e = pt_read_entry(&node_ptr, Ghost(node_pfn), idx, Tracked(self.perms.borrow()));
-        if entry_present(e) && !entry_huge(e) {
-            assert(node_pfn != self.perms@.root());
-            proof {
-                lemma_interior_child_level(self.perms@, node_pfn, idx as nat, pte_decode(e));
-            }
-            let cptr = entry_child(e, Tracked(self.perms.borrow()));
-            let cpfn = Ghost(pte_decode(e).target);
-            self.walk_addr_lvl1(cptr, cpfn, vaddr)
-        } else {
-            Mapping::Level2(PTLoc { ptr: node_ptr, node: Ghost(node_pfn), idx })
-        }
-    }
-
-    /// Level-3 (root) node: descend into the level-2 child if present, except for
-    /// the self-map slot, which is never followed.
-    fn walk_addr_lvl3(&self, node_ptr: PTPagePtr, Ghost(node_pfn): Ghost<PFN>, vaddr: VirtAddr)
-        -> (r: Mapping)
-        requires
-            self.perms@.wf(),
-            self.perms@.pages().dom().contains(node_pfn),
-            node_ptr.addr() == self.perms@.pages()[node_pfn].pptr().addr(),
-            self.perms@.pages()[node_pfn].level() == 3,
-        ensures
-            mapping_ok(r, self.perms@),
-    {
-        let idx = pt_index_exec(vaddr, 3);
-        let sm = idx_selfmap();
-        let e = pt_read_entry(&node_ptr, Ghost(node_pfn), idx, Tracked(self.perms.borrow()));
-        if entry_present(e) && !entry_huge(e) && idx != sm {
-            assert(idx as nat != IDX_SELFMAP);
-            proof {
-                lemma_interior_child_level(self.perms@, node_pfn, idx as nat, pte_decode(e));
-            }
-            let cptr = entry_child(e, Tracked(self.perms.borrow()));
-            let cpfn = Ghost(pte_decode(e).target);
-            self.walk_addr_lvl2(cptr, cpfn, vaddr)
-        } else {
-            Mapping::Level3(PTLoc { ptr: node_ptr, node: Ghost(node_pfn), idx })
-        }
-    }
-
-    /// Walk from the root and return the slot for `vaddr`.
-    fn walk_addr(&self, vaddr: VirtAddr) -> (r: Mapping)
-        requires
-            self.inv(),
-        ensures
-            mapping_ok(r, self.perms@),
-    {
-        let ghost root_pfn = self.perms@.root();
-        self.walk_addr_lvl3(self.root, Ghost(root_pfn), vaddr)
-    }
-
-    // =================================================================
-    // Verified allocate-on-walk: fill an absent slot by allocating and
-    // publishing a fresh interior page, descending to the next level.
-    // Mirrors the original `alloc_pte_lvl3 -> lvl2 -> lvl1`.
-    // `huge` selects the 2M path: at level 1 a huge mapping stops at the
-    // level-1 slot instead of allocating a level-0 leaf table.
-    // =================================================================
-
-    /// Fill an absent level-1 slot. For a 4K mapping, allocate a level-0 leaf
-    /// table and return its slot; for a huge (2M) mapping, return the level-1
-    /// slot directly.
-    fn alloc_pte_lvl1(&mut self, loc: PTLoc, vaddr: VirtAddr, huge: bool) -> (r: Mapping)
-        requires
-            old(self).inv(),
-            loc_at(loc, old(self).perms@, 1),
-        ensures
-            final(self).inv(),
-            mapping_ok(r, final(self).perms@),
-    {
-        let e = pt_read_entry(&loc.ptr, loc.node, loc.idx, Tracked(self.perms.borrow()));
-        if huge || entry_present(e) {
-            return Mapping::Level1(loc);
-        }
-        let (cptr, cpfn, cperm) = match pt_page_alloc_fresh(0, Tracked(self.perms.borrow())) {
-            Ok(t) => t,
-            Err(_e) => return Mapping::Level1(loc),
-        };
-        let pte = make_interior_pte(cpfn);
-        pt_publish_child(
-            &loc.ptr,
-            loc.node,
-            loc.idx,
-            pte,
-            Ghost(cpfn as nat),
-            cperm,
-            Tracked(self.perms.borrow_mut()),
-        );
-        let i0 = pt_index_exec(vaddr, 0);
-        Mapping::Level0(PTLoc { ptr: cptr, node: Ghost(cpfn as nat), idx: i0 })
-    }
-
-    /// Fill an absent level-2 slot by allocating a level-1 table, then continue.
-    fn alloc_pte_lvl2(&mut self, loc: PTLoc, vaddr: VirtAddr, huge: bool) -> (r: Mapping)
-        requires
-            old(self).inv(),
-            loc_at(loc, old(self).perms@, 2),
-        ensures
-            final(self).inv(),
-            mapping_ok(r, final(self).perms@),
-    {
-        let e = pt_read_entry(&loc.ptr, loc.node, loc.idx, Tracked(self.perms.borrow()));
-        if entry_present(e) {
-            return Mapping::Level2(loc);
-        }
-        let (cptr, cpfn, cperm) = match pt_page_alloc_fresh(1, Tracked(self.perms.borrow())) {
-            Ok(t) => t,
-            Err(_e) => return Mapping::Level2(loc),
-        };
-        let pte = make_interior_pte(cpfn);
-        pt_publish_child(
-            &loc.ptr,
-            loc.node,
-            loc.idx,
-            pte,
-            Ghost(cpfn as nat),
-            cperm,
-            Tracked(self.perms.borrow_mut()),
-        );
-        let i1 = pt_index_exec(vaddr, 1);
-        let child_loc = PTLoc { ptr: cptr, node: Ghost(cpfn as nat), idx: i1 };
-        self.alloc_pte_lvl1(child_loc, vaddr, huge)
-    }
-
-    /// Fill an absent level-3 (root) slot by allocating a level-2 table, then
-    /// continue. The self-map slot is excluded by the caller.
-    fn alloc_pte_lvl3(&mut self, loc: PTLoc, vaddr: VirtAddr, huge: bool) -> (r: Mapping)
-        requires
-            old(self).inv(),
-            loc_at(loc, old(self).perms@, 3),
-            loc.idx as nat != IDX_SELFMAP,
-        ensures
-            final(self).inv(),
-            mapping_ok(r, final(self).perms@),
-    {
-        let e = pt_read_entry(&loc.ptr, loc.node, loc.idx, Tracked(self.perms.borrow()));
-        if entry_present(e) {
-            return Mapping::Level3(loc);
-        }
-        let (cptr, cpfn, cperm) = match pt_page_alloc_fresh(2, Tracked(self.perms.borrow())) {
-            Ok(t) => t,
-            Err(_e) => return Mapping::Level3(loc),
-        };
-        let pte = make_interior_pte(cpfn);
-        pt_publish_child(
-            &loc.ptr,
-            loc.node,
-            loc.idx,
-            pte,
-            Ghost(cpfn as nat),
-            cperm,
-            Tracked(self.perms.borrow_mut()),
-        );
-        let i2 = pt_index_exec(vaddr, 2);
-        let child_loc = PTLoc { ptr: cptr, node: Ghost(cpfn as nat), idx: i2 };
-        self.alloc_pte_lvl2(child_loc, vaddr, huge)
-    }
-
-    /// Allocate (as needed) and return the level-0 slot for a 4K mapping of
-    /// `vaddr`. Routes through the verified walk and per-level allocators.
-    fn alloc_pte_4k(&mut self, vaddr: VirtAddr) -> (r: Mapping)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            mapping_ok(r, final(self).perms@),
-    {
-        let m = self.walk_addr(vaddr);
-        match m {
-            Mapping::Level0(loc) => Mapping::Level0(loc),
-            Mapping::Level1(loc) => self.alloc_pte_lvl1(loc, vaddr, false),
-            Mapping::Level2(loc) => self.alloc_pte_lvl2(loc, vaddr, false),
-            Mapping::Level3(loc) => {
-                let sm = idx_selfmap();
-                if loc.idx == sm {
-                    Mapping::Level3(loc)
-                } else {
-                    assert(loc.idx as nat != IDX_SELFMAP);
-                    self.alloc_pte_lvl3(loc, vaddr, false)
+            // Always check for reading. For the case of supervisor mode read user
+            // mode addresses, do special checking. For other cases, read is allowed.
+            if !self.user_mode_access && pteflags.contains(PTEntryFlags::USER) {
+                // Read not allowed with SMAP = 1 && flags.ac = 0
+                if self.cr4.contains(CR4Flags::SMAP) && !self.flags.contains(RFlags::AC) {
+                    return Err(pf_err);
                 }
             }
-        }
-    }
 
-    /// Allocate (as needed) and return the level-1 slot for a 2M mapping of
-    /// `vaddr`. Routes through the verified walk and per-level allocators.
-    fn alloc_pte_2m(&mut self, vaddr: VirtAddr) -> (r: Mapping)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            mapping_ok(r, final(self).perms@),
-    {
-        let m = self.walk_addr(vaddr);
-        match m {
-            Mapping::Level0(loc) => Mapping::Level0(loc),
-            Mapping::Level1(loc) => Mapping::Level1(loc),
-            Mapping::Level2(loc) => self.alloc_pte_lvl2(loc, vaddr, true),
-            Mapping::Level3(loc) => {
-                let sm = idx_selfmap();
-                if loc.idx == sm {
-                    Mapping::Level3(loc)
-                } else {
-                    assert(loc.idx as nat != IDX_SELFMAP);
-                    self.alloc_pte_lvl3(loc, vaddr, true)
+            if mem_am.contains(MemAccessMode::WRITE) {
+                if !self.user_mode_access && pteflags.contains(PTEntryFlags::USER) {
+                    // Check supervisor mode write user mode addresses
+                    if !self.cr0.contains(CR0Flags::WP) {
+                        // Check write with CR0.WP = 0
+                        if self.cr4.contains(CR4Flags::SMAP) && !self.flags.contains(RFlags::AC) {
+                            // Write not allowed with SMAP = 1 && flags.ac = 0
+                            return Err(pf_err);
+                        }
+                    } else {
+                        // Check write with CR0.WP = 1
+                        if !self.cr4.contains(CR4Flags::SMAP) {
+                            // SMAP = 0
+                            if !pteflags.contains(PTEntryFlags::WRITABLE) {
+                                // Write not allowed R/W = 0
+                                return Err(pf_err);
+                            }
+                        } else {
+                            // SMAP = 1
+                            if !self.flags.contains(RFlags::AC)
+                                || !pteflags.contains(PTEntryFlags::WRITABLE)
+                            {
+                                // Write not allowed with flags.AC = 0 || R/W = 0
+                                return Err(pf_err);
+                            }
+                        }
+                    }
+                } else if !self.user_mode_access && !pteflags.contains(PTEntryFlags::USER) {
+                    // Check supervisor mode write supervisor mode addresses
+                    if self.cr0.contains(CR0Flags::WP) && !pteflags.contains(PTEntryFlags::WRITABLE)
+                    {
+                        // Write not allowed with CR0.WP = 1 && R/W = 0
+                        return Err(pf_err);
+                    }
+                } else if self.user_mode_access && pteflags.contains(PTEntryFlags::USER) {
+                    // Check user mode write user mode addresses
+                    if !pteflags.contains(PTEntryFlags::WRITABLE) {
+                        // Write not allowed R/W = 0
+                        return Err(pf_err);
+                    }
+                }
+                // User mode write supervisor mode addresses is checked already
+            }
+
+            if mem_am.contains(MemAccessMode::FETCH) {
+                // For instruction fetch, the rule is the same except for the case of
+                // supervisor mode fetch user mode addresses
+                if !self.user_mode_access && pteflags.contains(PTEntryFlags::USER) {
+                    // Fetch not allowed with SMEP = 1
+                    if self.cr4.contains(CR4Flags::SMEP) {
+                        return Err(pf_err);
+                    }
+                }
+
+                // For non-32bit paging mode, fetch not allowed with efer.NXE = 1 && XD = 1
+                if self.cr4.contains(CR4Flags::PAE)
+                    && self.efer.contains(EFERFlags::NXE)
+                    && pteflags.contains(PTEntryFlags::NX)
+                {
+                    return Err(pf_err);
                 }
             }
-        }
+            true
+        } else {
+            false
+        };
+
+        Ok((entry, leaf))
     }
 
-    /// Map a 4K page at `vaddr` to `paddr`, allocating interior tables as needed.
-    pub fn map_4k(
-        &mut self,
-        vaddr: VirtAddr,
-        paddr: PhysAddr,
-        flags: PTEntryFlags,
-        shared: bool,
-    ) -> (r: Result<(), SvsmError>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-    {
-        let sm = idx_selfmap();
-        let i3 = pt_index_exec(vaddr, 3);
-        if i3 == sm {
-            return Err(svsm_mem_error());
-        }
-        let m = self.alloc_pte_4k(vaddr);
-        match m {
-            Mapping::Level0(loc) => {
-                let leaf = make_map_4k_leaf(paddr, flags, shared);
-                pt_write_entry(&loc.ptr, loc.node, loc.idx, leaf, Tracked(self.perms.borrow_mut()));
-                Ok(())
-            }
-            _ => Err(svsm_mem_error()),
-        }
-    }
+    fn default_pf_err(&self, mem_am: MemAccessMode) -> PageFaultError {
+        let mut err = PageFaultError::empty();
 
-    /// Unmap a 4K page at `vaddr`. A no-op when the address is not 4K-mapped.
-    pub fn unmap_4k(&mut self, vaddr: VirtAddr)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-    {
-        let sm = idx_selfmap();
-        let i3 = pt_index_exec(vaddr, 3);
-        if i3 == sm {
-            return;
+        if mem_am.contains(MemAccessMode::WRITE) {
+            err |= PageFaultError::W;
         }
-        let m = self.walk_addr(vaddr);
-        match m {
-            Mapping::Level0(loc) => {
-                let e0 = absent_entry();
-                pt_write_entry(&loc.ptr, loc.node, loc.idx, e0, Tracked(self.perms.borrow_mut()));
-            }
-            _ => {}
-        }
-    }
 
-    /// Map a 2M huge page at `vaddr` to `paddr`, allocating interior tables as
-    /// needed. Mirrors `map_4k` but stops at the level-1 (2M) leaf slot.
-    pub fn map_2m(
-        &mut self,
-        vaddr: VirtAddr,
-        paddr: PhysAddr,
-        flags: PTEntryFlags,
-        shared: bool,
-    ) -> (r: Result<(), SvsmError>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-    {
-        let sm = idx_selfmap();
-        let i3 = pt_index_exec(vaddr, 3);
-        if i3 == sm {
-            return Err(svsm_mem_error());
+        if mem_am.contains(MemAccessMode::FETCH) {
+            err |= PageFaultError::I;
         }
-        let m = self.alloc_pte_2m(vaddr);
-        match m {
-            Mapping::Level1(loc) => {
-                let leaf = make_map_2m_leaf(paddr, flags, shared);
-                pt_write_entry(&loc.ptr, loc.node, loc.idx, leaf, Tracked(self.perms.borrow_mut()));
-                Ok(())
-            }
-            _ => Err(svsm_mem_error()),
-        }
-    }
 
-    /// Unmap a 2M huge page at `vaddr`. A no-op when the address is not 2M-mapped.
-    pub fn unmap_2m(&mut self, vaddr: VirtAddr)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-    {
-        let sm = idx_selfmap();
-        let i3 = pt_index_exec(vaddr, 3);
-        if i3 == sm {
-            return;
+        if self.user_mode_access {
+            err |= PageFaultError::U;
         }
-        let m = self.walk_addr(vaddr);
-        match m {
-            Mapping::Level1(loc) => {
-                let e1 = absent_entry();
-                pt_write_entry(&loc.ptr, loc.node, loc.idx, e1, Tracked(self.perms.borrow_mut()));
-            }
-            _ => {}
-        }
+
+        err
     }
 }
-
-} // verus!

@@ -2,10 +2,13 @@
 //
 // Standalone copy of the SVSM kernel page table for Verus verification.
 //
-// The page-table code in `pagetable` is copied from `kernel/src/mm/pagetable.rs`.
-// The `*` modules below are the "core" dependencies copied from the kernel; their
-// verus annotations are neutralized (treated as trusted plain Rust) so that the
-// verification effort can focus on the page-table logic itself.
+// Top-level layout:
+//   pagetable  - the source under verification, a direct copy of
+//                kernel/src/mm/pagetable.rs, built against `stubs`.
+//   specs      - the verus specification & permission stack (perm / node / table).
+//   stubs      - trusted dependency definitions (address/types/memory_region +
+//                hardware/allocator/platform glue); less important, treated as
+//                external by Verus.
 
 #![no_std]
 #![allow(unused_braces)]
@@ -19,20 +22,12 @@ extern crate alloc;
 #[allow(unused_imports)]
 use vstd::prelude::*;
 
-// Vendored "core" dependencies (trusted, plain Rust).
-pub mod address;
-pub mod memory_region;
-pub mod types;
-
-// Trusted glue for hardware / allocator / platform that the page table relies
-// on, plus alignment helpers and bit macros.
+// Trusted dependency stubs (address / types / memory_region + platform glue).
 pub mod stubs;
 
-// The verus specification & permission stack (perm / node / table). The single
-// home for `verus! { }` specs/proofs for this crate.
-//
-// NOTE: `pagetable.rs` (the kernel copy) is intentionally NOT a module right now.
-// Its old in-place verification used the previous specs API and has been retired;
-// the original code will be re-ported and verified cleanly against this stack.
+// The source under verification (direct copy of kernel/src/mm/pagetable.rs).
+pub mod pagetable;
+
+// The verus specification & permission stack (perm / node / table).
 #[cfg(verus_only)]
 pub mod specs;

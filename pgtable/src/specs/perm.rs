@@ -35,24 +35,11 @@
 // `VA` / `PA` are plain addresses, named to avoid confusion with vstd's `PPtr`.
 //
 // Compiled only under verification (`verus_only`).
-use crate::address::{Address, PhysAddr, VirtAddr};
-use crate::stubs::{SvsmError, phys_to_virt, virt_to_phys};
+use crate::stubs::address::{Address, PhysAddr, VirtAddr};
+use crate::stubs::{SvsmError, alloc_zeroed_page, free_page, phys_to_virt, virt_to_phys};
 use core::marker::PhantomData;
 use vstd::prelude::*;
 use vstd::raw_ptr::MemContents;
-
-// Trusted page-allocator boundary. Declared `extern` so this standalone
-// verification crate carries no concrete allocator: when the crate moves back
-// into the kernel these are pointed at the real per-CPU page allocator. The
-// crate is a verification-only rlib and never links them. They are the only
-// allocation primitives the permission layer is built on (no `std`/`Box`).
-unsafe extern "Rust" {
-    /// Allocate one zeroed 4K page; returns its direct-map virtual address, or 0
-    /// on allocation failure.
-    fn svsm_alloc_zeroed_page() -> usize;
-    /// Free a 4K page previously returned by `svsm_alloc_zeroed_page`.
-    fn svsm_free_page(va: usize);
-}
 
 verus! {
 
@@ -379,11 +366,12 @@ pub fn page_take<V>(va: VA, Tracked(perm): Tracked<&mut PagePerm<V>>) -> (v: V)
     unsafe { core::ptr::read(va.0 as *const V) }
 }
 
-// --- trusted allocate / free against the global page allocator ---
-/// Allocate one zeroed 4K page from the page allocator and return its access
-/// addresses plus the owning permission. The page is born zero-initialized
+// --- trusted allocate / free, via the shared stub page allocator ---
+/// Allocate one zeroed 4K page from the (stub) page allocator and return its
+/// access addresses plus the owning permission. The page is born zero-initialized
 /// (`V::zeroed()`); no page-sized value is moved in. No dealloc token is minted:
-/// the returned `PagePerm` *is* the right to later free the page.
+/// the returned `PagePerm` *is* the right to later free the page. This rests on
+/// the same `stubs::alloc_zeroed_page` the page-table source uses.
 #[verifier::external_body]
 pub fn page_alloc_zeroed<V: ZeroInit>() -> (r: Result<(VA, PA, Tracked<PagePerm<V>>), SvsmError>)
     ensures
@@ -394,13 +382,12 @@ pub fn page_alloc_zeroed<V: ZeroInit>() -> (r: Result<(VA, PA, Tracked<PagePerm<
             &&& perm@.opt_value() == MemContents::Init(V::zeroed())
         },
 {
-    // SAFETY: trusted page-allocator boundary; a 0 result signals failure.
-    let addr = unsafe { svsm_alloc_zeroed_page() };
-    if addr == 0 {
-        return Err(SvsmError::Mem);
-    }
-    let paddr = virt_to_phys(VirtAddr::new(addr));
-    Ok((VA(addr), PA(paddr.bits()), Tracked::assume_new()))
+    let vaddr = match alloc_zeroed_page() {
+        Some(v) => v,
+        None => return Err(SvsmError::Mem),
+    };
+    let paddr = virt_to_phys(vaddr);
+    Ok((VA(vaddr.bits()), PA(paddr.bits()), Tracked::assume_new()))
 }
 
 /// Free a page-allocator page, consuming the only authority that can access it.
@@ -413,10 +400,8 @@ pub fn page_free<V>(va: VA, Tracked(perm): Tracked<PagePerm<V>>)
         va == perm.va(),
 {
     // SAFETY: consuming `perm` proves no other access exists; the page came from
-    // `page_alloc_zeroed`.
-    unsafe {
-        svsm_free_page(va.0);
-    }
+    // `page_alloc_zeroed`, i.e. `stubs::alloc_zeroed_page`.
+    free_page(VirtAddr::from(va.0));
 }
 
 // =====================================================================
