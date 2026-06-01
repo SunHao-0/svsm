@@ -28,26 +28,11 @@ pub mod types;
 // on, plus alignment helpers and bit macros.
 pub mod stubs;
 
-// The verification target.
-pub mod pagetable;
-
-// Linear page-permission types (Layer 0 physical-frame region + Layer 1 typed,
-// PFN-tagged page), in the style of vstd's `raw_ptr`/`simple_pptr`.
-#[cfg(verus_only)]
-pub mod perm;
-
-// Layer 2: the page-table-page permission (`PTNodePerm`), built on a `PtPage`
-// mapping trait the page-table author implements for their page type.
-#[cfg(verus_only)]
-pub mod node;
-
-// Layer 3: the page table - a collection of `PTNodePerm`s with the tree-shape
-// invariants, the MMU walk, region typing and confidentiality, all stated over
-// the permission set.
-#[cfg(verus_only)]
-pub mod table;
-
-// Verus page-table model: conceptual tree map + value-tracking permissions +
-// properties. The single home for `verus! { }` specs/proofs for this crate.
+// The verus specification & permission stack (perm / node / table). The single
+// home for `verus! { }` specs/proofs for this crate.
+//
+// NOTE: `pagetable.rs` (the kernel copy) is intentionally NOT a module right now.
+// Its old in-place verification used the previous specs API and has been retired;
+// the original code will be re-ported and verified cleanly against this stack.
 #[cfg(verus_only)]
 pub mod specs;

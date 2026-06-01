@@ -17,9 +17,9 @@
 //
 // Compiled only under verification (`verus_only`).
 
-use crate::node::{PTNodePerm, PtPage};
-use crate::specs::{
-    ENTRIES, Entry, PFN, PTNode, PageSz, ROOT_LEVEL, VPage, pt_index, size_of_level, span,
+use crate::specs::node::{
+    ENTRIES, Entry, PFN, PTNode, PTNodePerm, PageSz, PtPage, ROOT_LEVEL, VPage, pt_index,
+    size_of_level, span,
 };
 use vstd::prelude::*;
 

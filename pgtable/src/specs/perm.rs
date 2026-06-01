@@ -56,6 +56,14 @@ unsafe extern "Rust" {
 
 verus! {
 
+/// Declare the trusted `SvsmError` (defined outside `verus!`, in `stubs`) as an
+/// opaque type so it may appear in spec-visible signatures (e.g. allocator
+/// `Result` returns).
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(missing_debug_implementations)]
+pub struct ExSvsmError(SvsmError);
+
 /// Bytes per 4K page (spec-level arithmetic uses `nat`).
 pub spec const PAGE_SIZE: nat = 4096;
 
