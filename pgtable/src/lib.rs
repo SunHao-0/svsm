@@ -41,6 +41,12 @@ pub mod perm;
 #[cfg(verus_only)]
 pub mod node;
 
+// Layer 3: the page table - a collection of `PTNodePerm`s with the tree-shape
+// invariants, the MMU walk, region typing and confidentiality, all stated over
+// the permission set.
+#[cfg(verus_only)]
+pub mod table;
+
 // Verus page-table model: conceptual tree map + value-tracking permissions +
 // properties. The single home for `verus! { }` specs/proofs for this crate.
 #[cfg(verus_only)]
