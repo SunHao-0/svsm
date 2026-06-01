@@ -227,7 +227,9 @@ unsafe impl<T> Sync for ImmutAfterInitCell<T> {}
 
 impl<T> ImmutAfterInitCell<T> {
     pub const fn uninit() -> Self {
-        Self { value: UnsafeCell::new(None) }
+        Self {
+            value: UnsafeCell::new(None),
+        }
     }
 
     pub fn init(&self, v: T) -> ImmutAfterInitResult<()> {

@@ -16,7 +16,6 @@
 // *operations* (map/unmap) are built on `node`'s verified ops in a later layer.
 //
 // Compiled only under verification (`verus_only`).
-
 use crate::specs::node::{
     ENTRIES, Entry, PFN, PTNode, PTNodePerm, PageSz, PtPage, ROOT_LEVEL, VPage, pt_index,
     size_of_level, span,
@@ -28,7 +27,6 @@ verus! {
 // =====================================================================
 // Top-level (PML4) index partition of the address space
 // =====================================================================
-
 pub spec const IDX_PERTASK: nat = 508;
 
 pub spec const IDX_SELFMAP: nat = 493;
@@ -40,7 +38,6 @@ pub spec const IDX_SHARED: nat = 511;
 // =====================================================================
 // Walk result and architecture-parameterized permission combination
 // =====================================================================
-
 /// Effective access permission produced by a walk.
 #[derive(PartialEq, Eq, Structural, Debug)]
 pub struct Perm {
@@ -101,7 +98,6 @@ pub open spec fn leaf_only_perm(e: Entry) -> Perm {
 // =====================================================================
 // The page table: a permission collection
 // =====================================================================
-
 /// All page-table-node permissions of one page table, keyed by physical frame,
 /// together with the root frame (CR3). Owning the permissions - not just a view -
 /// is what makes this the page table rather than a snapshot of it.
@@ -141,7 +137,6 @@ impl<V: PtPage> PageTablePerms<V> {
     }
 
     // --- the MMU walk, over the permission set -----------------------
-
     /// The MMU walk from `node` at `level` for page `vpn`, accumulating
     /// permission. Bounded by `level`, so it terminates even though the self-map
     /// makes the graph cyclic.
@@ -186,7 +181,6 @@ impl<V: PtPage> PageTablePerms<V> {
     }
 
     // --- structural well-formedness ----------------------------------
-
     /// The recursive self-map slot: the root's entry that points back to the root.
     pub open spec fn is_self_map(self, n: PFN, idx: nat) -> bool {
         self.level(n) == ROOT_LEVEL && idx == IDX_SELFMAP
@@ -195,7 +189,8 @@ impl<V: PtPage> PageTablePerms<V> {
     /// Node `n`'s present entries resolve correctly: leaves are aligned to their
     /// level, interior links resolve one level down (self-map aside).
     pub open spec fn node_wf(self, n: PFN) -> bool {
-        forall|idx: nat| #![trigger self.entry(n, idx)]
+        forall|idx: nat|
+            #![trigger self.entry(n, idx)]
             (idx < ENTRIES && self.node(n).e.dom().contains(idx) && self.entry(n, idx).present)
                 ==> {
                 let e = self.entry(n, idx);
@@ -227,19 +222,20 @@ impl<V: PtPage> PageTablePerms<V> {
     pub open spec fn wf(self) -> bool {
         &&& self.contains(self.root())
         &&& self.level(self.root()) == ROOT_LEVEL
-        &&& forall|p: PFN| #[trigger] self.contains(p) ==> {
-            &&& self.pages()[p].wf()
-            &&& self.pages()[p].pfn() == p
-        }
+        &&& forall|p: PFN| #[trigger]
+            self.contains(p) ==> {
+                &&& self.pages()[p].wf()
+                &&& self.pages()[p].pfn() == p
+            }
         &&& self.nodes_wf()
         &&& self.ad_pinned()
     }
 
     // --- region typing -----------------------------------------------
-
     /// Every translation respects its region's policy.
     pub open spec fn region_typed(self, arch: Arch) -> bool {
-        forall|vpn: VPage| #![trigger self.walk(arch, vpn)]
+        forall|vpn: VPage|
+            #![trigger self.walk(arch, vpn)]
             self.walk(arch, vpn) is Some ==> region_walk_ok(
                 region_of(vpn),
                 self.walk(arch, vpn)->Some_0,
@@ -247,21 +243,22 @@ impl<V: PtPage> PageTablePerms<V> {
     }
 
     // --- the A/D ownership discipline --------------------------------
-
     /// Every entry of every live node is A/D-pinned, so the MMU's only concurrent
     /// write (raising ACCESSED) is a no-op (see `lemma_entry_pin_accessed_noop`).
     pub open spec fn ad_pinned(self) -> bool {
-        forall|n: PFN, i: nat| #![trigger self.entry(n, i)]
-            (self.contains(n) && i < ENTRIES && self.node(n).e.dom().contains(i))
-                ==> entry_pinned(self.entry(n, i))
+        forall|n: PFN, i: nat|
+            #![trigger self.entry(n, i)]
+            (self.contains(n) && i < ENTRIES && self.node(n).e.dom().contains(i)) ==> entry_pinned(
+                self.entry(n, i),
+            )
     }
 
     // --- confidentiality ---------------------------------------------
-
     /// Every translation reads a page as host-shared (`enc == false`) iff its
     /// frames are in the software's `host_shared` set.
     pub open spec fn confidential(self, arch: Arch, host_shared: Set<PFN>) -> bool {
-        forall|vpn: VPage| #![trigger self.walk(arch, vpn)]
+        forall|vpn: VPage|
+            #![trigger self.walk(arch, vpn)]
             self.walk(arch, vpn) is Some ==> {
                 let w = self.walk(arch, vpn)->Some_0;
                 (!w.enc) <==> walk_frames(w).subset_of(host_shared)
@@ -277,7 +274,6 @@ impl<V: PtPage> PageTablePerms<V> {
 // such permissive interiors do not restrict, so the combined walk permission is
 // decided by the leaf alone. The two algebraic facts below are the heart of that
 // argument; both are independent of any particular table.
-
 pub open spec fn permissive(e: Entry) -> bool {
     e.present && e.w && e.user && !e.nx
 }
@@ -301,7 +297,6 @@ pub proof fn lemma_top_combine_is_leaf_only(e: Entry)
 // =====================================================================
 // Region typing policy
 // =====================================================================
-
 #[derive(PartialEq, Eq, Structural, Debug)]
 pub enum RegionKind {
     User,
@@ -345,7 +340,6 @@ pub open spec fn region_walk_ok(kind: RegionKind, w: Walk) -> bool {
 // =====================================================================
 // A/D-pin discipline and confidentiality helpers
 // =====================================================================
-
 /// A present entry has ACCESSED set, and a writable one has DIRTY set.
 pub open spec fn entry_pinned(e: Entry) -> bool {
     e.present ==> (e.accessed && (e.w ==> e.dirty))

@@ -16,7 +16,6 @@
 //!               permission set.
 //!
 //! Compiled only under verification (`verus_only`).
-
 pub mod node;
 pub mod perm;
 pub mod table;

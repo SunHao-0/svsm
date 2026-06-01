@@ -34,7 +34,6 @@ verus! {
 // =====================================================================
 // The conceptual model: page-table entries and nodes
 // =====================================================================
-
 /// Virtual page number (`vaddr >> 12`).
 pub type VPage = nat;
 
