@@ -31,6 +31,11 @@ pub mod stubs;
 // The verification target.
 pub mod pagetable;
 
+// Linear page-permission types (Layer 0 physical-frame region + Layer 1 typed,
+// PFN-tagged page), in the style of vstd's `raw_ptr`/`simple_pptr`.
+#[cfg(verus_only)]
+pub mod perm;
+
 // Verus page-table model: conceptual tree map + value-tracking permissions +
 // properties. The single home for `verus! { }` specs/proofs for this crate.
 #[cfg(verus_only)]
