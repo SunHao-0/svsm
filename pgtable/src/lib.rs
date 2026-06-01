@@ -36,6 +36,11 @@ pub mod pagetable;
 #[cfg(verus_only)]
 pub mod perm;
 
+// Layer 2: the page-table-page permission (`PTNodePerm`), built on a `PtPage`
+// mapping trait the page-table author implements for their page type.
+#[cfg(verus_only)]
+pub mod node;
+
 // Verus page-table model: conceptual tree map + value-tracking permissions +
 // properties. The single home for `verus! { }` specs/proofs for this crate.
 #[cfg(verus_only)]
