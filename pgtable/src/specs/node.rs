@@ -24,7 +24,7 @@
 //
 // Compiled only under verification (`verus_only`).
 use crate::specs::perm::{
-    PA, PagePerm, VA, page_alloc_zeroed, page_borrow, page_borrow_mut, page_free, zeroed,
+    PA, PagePerm, VA, page_alloc_zeroed, page_borrow, page_borrow_mut, page_free, pfn_of, zeroed,
 };
 use crate::stubs::SvsmError;
 use vstd::prelude::*;
@@ -153,6 +153,22 @@ pub open spec fn interior_entry(child: PFN) -> Entry {
     }
 }
 
+/// The abstract absent (cleared) entry: not present.
+pub open spec fn entry_absent() -> Entry {
+    Entry {
+        present: false,
+        leaf: false,
+        target: 0,
+        w: false,
+        user: false,
+        nx: false,
+        global: false,
+        enc: false,
+        accessed: false,
+        dirty: false,
+    }
+}
+
 // =====================================================================
 // The mapping trait: a page-table page maps to an abstract `PTNode`
 // =====================================================================
@@ -217,6 +233,12 @@ pub trait PtPage: Sized {
         ensures
             Self::decode(pte) == interior_entry(child as nat),
     ;
+
+    /// Build the cleared (absent) entry, whose decoding is `entry_absent()`.
+    fn make_absent() -> (pte: Self::Pte)
+        ensures
+            Self::decode(pte) == entry_absent(),
+    ;
 }
 
 /// Every page of a given `PtPage` type maps to a structurally well-formed node.
@@ -249,6 +271,15 @@ pub broadcast proof fn lemma_node_level_bound<V: PtPage>(perm: PTNodePerm<V>)
         perm.wf(),
     ensures
         (#[trigger] perm.level()) <= ROOT_LEVEL,
+{
+}
+
+/// A node permission's PFN is the PFN of its physical address. Broadcast so the
+/// table layer can connect an exec PFN (`pfn_of_pa(pa)`) to a node's `pfn()` past
+/// the closed `PTNodePerm::pfn`.
+pub broadcast proof fn lemma_node_pfn<V: PtPage>(perm: PTNodePerm<V>)
+    ensures
+        (#[trigger] perm.pfn()) == pfn_of(perm.pa()),
 {
 }
 

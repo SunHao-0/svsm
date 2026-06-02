@@ -19,11 +19,11 @@
 //
 // Compiled only under verification (`verus_only`).
 use crate::specs::node::{
-    ENTRIES, Entry, PFN, PTNode, PTNodePerm, PageSz, PtPage, ROOT_LEVEL, VPage, interior_entry,
-    lemma_node_level_bound, lemma_node_struct_wf, node_alloc, node_free, node_read_entry,
-    node_set_entry, pt_index, size_of_level, span,
+    ENTRIES, Entry, PFN, PTNode, PTNodePerm, PageSz, PtPage, ROOT_LEVEL, VPage, entry_absent,
+    interior_entry, lemma_node_level_bound, lemma_node_pfn, lemma_node_struct_wf, node_alloc,
+    node_free, node_read_entry, node_set_entry, pt_index, size_of_level, span,
 };
-use crate::specs::perm::{PA, VA};
+use crate::specs::perm::{PA, VA, pfn_of_pa};
 use crate::stubs::SvsmError;
 use vstd::prelude::*;
 
@@ -113,9 +113,9 @@ pub open spec fn leaf_only_perm(e: Entry) -> Perm {
 /// rather than a snapshot of it; `frames_` is the analogue for the data pages it
 /// refers to.
 pub tracked struct PageTablePerms<V: PtPage> {
-    root_: PFN,
-    pages_: Map<PFN, PTNodePerm<V>>,
-    frames_: Set<PFN>,
+    ghost root_: PFN,
+    tracked pages_: Map<PFN, PTNodePerm<V>>,
+    ghost frames_: Set<PFN>,
 }
 
 impl<V: PtPage> PageTablePerms<V> {
@@ -829,6 +829,474 @@ pub fn alloc_child<V: PtPage>(
         lemma_link_child_preserves_tree_inv::<V>(t0, t1, parent, idx as nat, cp);
     }
     Ok((child_va, child_pfn))
+}
+
+/// The executable self-map index, tied to the spec constant `IDX_SELFMAP`.
+pub fn idx_selfmap() -> (r: usize)
+    ensures
+        r as nat == IDX_SELFMAP,
+{
+    493
+}
+
+/// Build the one-node, self-mapped table from a root node permission whose only
+/// present entry is the self-map. Proves the full invariant for the singleton
+/// store. (A proof fn so the tracked `Map`/struct construction is in proof mode.)
+pub proof fn lemma_singleton_table<V: PtPage>(rp: PFN, tracked root_perm: PTNodePerm<V>) -> (tracked
+    perms: PageTablePerms<V>)
+    requires
+        root_perm.wf(),
+        root_perm.pfn() == rp,
+        root_perm.level() == ROOT_LEVEL,
+        root_perm.node().e[IDX_SELFMAP] == interior_entry(rp),
+        forall|i: nat| i < ENTRIES && i != IDX_SELFMAP ==> !(#[trigger] root_perm.node().e[i]).present,
+    ensures
+        perms.wf(),
+        perms.root() == rp,
+        perms.contains(rp),
+        perms.node_va(rp) == root_perm.va(),
+        perms.level(rp) == ROOT_LEVEL,
+{
+    broadcast use lemma_node_struct_wf, lemma_node_pfn;
+
+    let va = root_perm.va();
+    let tracked mut m = Map::<PFN, PTNodePerm<V>>::tracked_empty();
+    m.tracked_insert(rp, root_perm);
+    let tracked perms = PageTablePerms { root_: rp, pages_: m, frames_: Set::empty() };
+
+    assert(perms.contains(rp));
+    assert(perms.node_va(rp) == va);
+    assert(perms.node(rp).wf());
+    assert(perms.entry(rp, IDX_SELFMAP) == interior_entry(rp));
+    assert(perms.interior_at(rp, IDX_SELFMAP));
+    assert forall|c: PFN| perms.contains(c) implies c == rp by {}
+    assert(perms.store_wf());
+    assert(perms.tree_wf()) by {
+        assert forall|n1: PFN, i1: nat, n2: PFN, i2: nat|
+            (perms.interior_at(n1, i1) && perms.interior_at(n2, i2)) implies (n1 == n2 && i1 == i2)
+            by {}
+        assert forall|c: PFN| #![trigger perms.contains(c)]
+            perms.contains(c) implies exists|n: PFN, i: nat|
+            #[trigger] perms.interior_at(n, i) && perms.entry(n, i).target == c by {
+            assert(perms.interior_at(rp, IDX_SELFMAP) && perms.entry(rp, IDX_SELFMAP).target == rp);
+        }
+    }
+    assert(perms.links_wf()) by {
+        assert(perms.node_wf(rp));
+    }
+    assert(perms.ad_pinned()) by {
+        assert forall|n: PFN, i: nat|
+            (perms.contains(n) && i < ENTRIES && perms.node(n).e.dom().contains(i)) implies
+                entry_pinned(#[trigger] perms.entry(n, i)) by {}
+    }
+    perms
+}
+
+/// Create a fresh, self-mapped page table: a single empty root node at the top
+/// level whose only entry is the recursive self-map `root[IDX_SELFMAP] -> root`.
+/// This is the bootstrap that establishes `wf` (every other op preserves it).
+pub fn new_root<V: PtPage>() -> (r: Result<(VA, usize, Tracked<PageTablePerms<V>>), SvsmError>)
+    ensures
+        r matches Ok((root_va, root_pfn, perms)) ==> {
+            &&& perms@.wf()
+            &&& perms@.root() == root_pfn as nat
+            &&& perms@.contains(root_pfn as nat)
+            &&& root_va == perms@.node_va(root_pfn as nat)
+            &&& perms@.level(root_pfn as nat) == ROOT_LEVEL
+        },
+{
+    let (root_va, root_pa, root_perm_t) = match node_alloc::<V>(3) {
+        Ok(t) => t,
+        Err(e) => return Err(e),
+    };
+    let Tracked(mut root_perm) = root_perm_t;
+    let root_pfn = pfn_of_pa(root_pa);
+    proof {
+        broadcast use lemma_node_pfn;
+    }
+    // Install the recursive self-map: root[IDX_SELFMAP] -> root.
+    let sm = idx_selfmap();
+    let pte = V::make_interior(root_pfn);
+    node_set_entry::<V>(root_va, Tracked(&mut root_perm), sm, pte);
+    let tracked perms;
+    proof {
+        broadcast use lemma_node_struct_wf, lemma_node_pfn;
+        perms = lemma_singleton_table::<V>(root_pfn as nat, root_perm);
+    }
+    Ok((root_va, root_pfn, Tracked(perms)))
+}
+
+/// `node_wf` transfer for unlink, isolated to a SMALL proof context so the (heavy)
+/// `node_wf` unfolding does not interact with the main lemma's large proof state -
+/// the difference between a 4s and a >75s check. Given that present entries are
+/// unchanged, surviving interior targets are still live (`!= child`), and levels
+/// are preserved off `child`, a node that was well-formed in `t0` still is in `t1`.
+#[verifier::rlimit(40)]
+pub proof fn lemma_unlink_node_wf<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+    n: PFN,
+)
+    requires
+        t0.node_wf(n),
+        t0.node(n).wf(),
+        t1.node(n).wf(),
+        t1.contains(n),
+        n != child,
+        t1.entry(parent, idx) == entry_absent(),
+        forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c != child && t0.contains(c)),
+        forall|m: PFN, j: nat|
+            (m != child && (m != parent || j != idx)) ==> #[trigger] t1.entry(m, j) == t0.entry(
+                m,
+                j,
+            ),
+        forall|m: PFN, j: nat| #[trigger] t1.interior_at(m, j) ==> t1.entry(m, j).target != child,
+    ensures
+        t1.node_wf(n),
+{
+    assert(t1.level(n) == t0.level(n));
+    assert forall|i: nat|
+        #![trigger t1.entry(n, i)]
+        (i < ENTRIES && t1.node(n).e.dom().contains(i) && t1.entry(n, i).present) implies {
+            let e = t1.entry(n, i);
+            if t1.level(n) == 0 || e.leaf {
+                t1.level(n) <= 2 && e.target % span(t1.level(n)) == 0
+            } else {
+                &&& t1.contains(e.target)
+                &&& if t1.is_self_map(n, i) {
+                    e.target == n
+                } else {
+                    t1.level(n) >= 1 && t1.level(e.target) == t1.level(n) - 1
+                }
+            }
+        } by {
+        if n == parent && i == idx {
+            assert(t1.entry(parent, idx) == entry_absent());  // !present: antecedent is false
+        } else {
+            assert(t1.entry(n, i) == t0.entry(n, i));  // surviving slot is unchanged
+            let e = t1.entry(n, i);
+            if t1.level(n) != 0 && !e.leaf {
+                assert(t1.interior_at(n, i));  // present interior
+                assert(e.target != child);  // surviving target is live
+                assert(t0.contains(e.target));  // t0.node_wf at i
+                assert(t1.contains(e.target));  // contains-iff (target != child)
+                assert(t1.is_self_map(n, i) == t0.is_self_map(n, i));  // level(n) unchanged
+                assert(t1.level(e.target) == t0.level(e.target));  // target != child
+            }
+        }
+    }
+}
+
+/// `links_wf` transfer for unlink, in its OWN small proof context: the main lemma
+/// accumulates a large quantifier set (the whole tree argument), which makes even
+/// discharging this grind. Taking only the RAW structural relationship (the main
+/// lemma's own hypotheses, so the call discharges verbatim) and re-deriving the
+/// per-entry facts here keeps the context small and the check fast.
+#[verifier::rlimit(40)]
+pub proof fn lemma_unlink_links_wf<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+)
+    requires
+        t0.store_wf(),
+        t0.tree_inv(),
+        t0.contains(parent),
+        idx < ENTRIES,
+        t0.interior_at(parent, idx),
+        t0.entry(parent, idx).target == child,
+        t0.node(child).empty(),
+        t1.store_wf(),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c != child && t0.contains(c)),
+        t1.node(parent) == t0.node(parent).update(idx, entry_absent()),
+        forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
+    ensures
+        t1.links_wf(),
+{
+    broadcast use lemma_node_struct_wf, lemma_node_level_bound;
+
+    assert(t0.node_wf(parent));
+    assert(t0.contains(child));
+    assert(t0.node(parent).e.dom().contains(idx));
+    assert(t1.entry(parent, idx) == entry_absent());
+    // entries unchanged off the absent slot and the removed child:
+    assert forall|n: PFN, i: nat| (n != child && (n != parent || i != idx)) implies
+        #[trigger] t1.entry(n, i) == t0.entry(n, i) by {
+        if n == parent {
+            assert(t1.node(parent).e[i] == t0.node(parent).e.insert(idx, entry_absent())[i]);
+        }
+    }
+    assert(!t1.interior_at(parent, idx));
+    // a t1 interior entry is an unchanged t0 interior entry:
+    assert forall|n: PFN, i: nat| t1.interior_at(n, i) implies (#[trigger] t0.interior_at(n, i)
+        && t1.entry(n, i) == t0.entry(n, i)) by {
+        assert(t1.contains(n));  // => n != child
+        assert(n != parent || i != idx);
+    }
+    // (parent,idx) is the unique t0 interior targeting child; hence no surviving
+    // interior entry targets child.
+    assert forall|n: PFN, i: nat| (#[trigger] t0.interior_at(n, i) && t0.entry(n, i).target == child)
+        implies (n == parent && i == idx) by {
+        assert(t0.interior_at(parent, idx) && t0.entry(parent, idx).target == child);
+    }
+    assert forall|n: PFN, i: nat| #[trigger] t1.interior_at(n, i) implies t1.entry(n, i).target
+        != child by {
+        assert(t0.interior_at(n, i) && t1.entry(n, i) == t0.entry(n, i));
+    }
+    // node_wf per node, in the isolated node-level context.
+    assert forall|n: PFN| #[trigger] t1.contains(n) implies t1.node_wf(n) by {
+        assert(t0.contains(n));  // contains-iff
+        assert(t0.node_wf(n));  // t0.links_wf
+        lemma_unlink_node_wf::<V>(t0, t1, parent, idx, child, n);
+    }
+}
+
+/// `tree_wf` (+ root) transfer for unlink, in its own small context. By injectivity
+/// `(parent, idx)` was `child`'s only parent and an empty `child` is nobody's
+/// parent, so the surviving interior entries are an injective, fully-connected
+/// subset of `t0`'s.
+#[verifier::rlimit(40)]
+pub proof fn lemma_unlink_tree_wf<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+)
+    requires
+        t0.store_wf(),
+        t0.tree_inv(),
+        t0.contains(parent),
+        idx < ENTRIES,
+        t0.interior_at(parent, idx),
+        t0.entry(parent, idx).target == child,
+        !(parent == t0.root() && idx == IDX_SELFMAP),
+        t0.node(child).empty(),
+        t1.store_wf(),
+        t1.root() == t0.root(),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c != child && t0.contains(c)),
+        t1.node(parent) == t0.node(parent).update(idx, entry_absent()),
+        forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
+    ensures
+        t1.tree_wf(),
+        t1.contains(t1.root()),
+        t1.level(t1.root()) == ROOT_LEVEL,
+{
+    broadcast use lemma_node_struct_wf, lemma_node_level_bound;
+
+    let r = t0.root();
+    assert(t0.node_wf(parent));
+    assert(t0.contains(child));
+    assert(child != parent);
+    // `child` is not the root: only the self-map targets the root (injectivity),
+    // and (parent, idx) is not the self-map.
+    assert(child != r) by {
+        if child == r {
+            assert(t0.interior_at(r, IDX_SELFMAP) && t0.entry(r, IDX_SELFMAP).target == r);
+        }
+    }
+    assert(t0.node(parent).e.dom().contains(idx));
+    assert forall|n: PFN, i: nat| (n != child && (n != parent || i != idx)) implies
+        #[trigger] t1.entry(n, i) == t0.entry(n, i) by {
+        if n == parent {
+            assert(t1.node(parent).e[i] == t0.node(parent).e.insert(idx, entry_absent())[i]);
+        }
+    }
+    assert(t1.entry(parent, idx) == entry_absent());
+    assert(!t1.interior_at(parent, idx));
+    assert forall|i: nat| !#[trigger] t0.interior_at(child, i) by {}
+    assert forall|i: nat| !#[trigger] t1.interior_at(child, i) by {}
+    assert forall|n: PFN, i: nat| t1.interior_at(n, i) implies (#[trigger] t0.interior_at(n, i)
+        && t1.entry(n, i) == t0.entry(n, i) && n != child) by {
+        assert(t1.contains(n));  // => n != child
+        assert(n != parent || i != idx);  // else contradicts !t1.interior_at(parent, idx)
+    }
+    // root stays live, at the top level.
+    assert(t1.contains(r));
+    assert(t1.level(r) == ROOT_LEVEL);
+
+    // --- tree_wf, clause by clause -----------------------------------
+    assert forall|n: PFN| #![trigger t1.contains(n)]
+        t1.contains(n) && t1.level(n) == ROOT_LEVEL implies n == r by {
+        assert(t0.contains(n));
+    }
+    assert(t1.interior_at(r, IDX_SELFMAP));
+    assert(t1.entry(r, IDX_SELFMAP) == t0.entry(r, IDX_SELFMAP));
+    // injectivity: t1's interior entries are a subset of t0's (unchanged), so inherit it.
+    assert forall|n1: PFN, i1: nat, n2: PFN, i2: nat|
+        (#[trigger] t1.interior_at(n1, i1) && #[trigger] t1.interior_at(n2, i2) && t1.entry(
+            n1,
+            i1,
+        ).target == t1.entry(n2, i2).target) implies (n1 == n2 && i1 == i2) by {
+        assert(t0.interior_at(n1, i1) && t1.entry(n1, i1) == t0.entry(n1, i1));
+        assert(t0.interior_at(n2, i2) && t1.entry(n2, i2) == t0.entry(n2, i2));
+    }
+    // connectivity: each surviving node keeps its (unchanged) t0 parent.
+    assert forall|c: PFN| #![trigger t1.contains(c)]
+        t1.contains(c) implies exists|n: PFN, i: nat|
+        #[trigger] t1.interior_at(n, i) && t1.entry(n, i).target == c by {
+        assert(t0.contains(c) && c != child);
+        let w = choose|n: PFN, i: nat|
+            #![trigger t0.interior_at(n, i)]
+            t0.interior_at(n, i) && t0.entry(n, i).target == c;
+        // w is not in `child` (empty) and not (parent, idx) (it targets c != child),
+        // so w is an unchanged t1 interior entry.
+        assert(w.0 != child);  // `child` has no interior entries
+        assert(w.0 != parent || w.1 != idx);  // (parent,idx) targets child != c
+        assert(t1.entry(w.0, w.1) == t0.entry(w.0, w.1));
+        assert(t1.interior_at(w.0, w.1) && t1.entry(w.0, w.1).target == c);
+    }
+    assert(t1.tree_wf());
+}
+
+/// `ad_pinned` transfer for unlink, in its own small context: the cleared slot is
+/// now absent (vacuously pinned) and every other present entry of a live node is
+/// unchanged from `t0`, where it was pinned.
+#[verifier::rlimit(40)]
+pub proof fn lemma_unlink_ad<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+)
+    requires
+        t0.store_wf(),
+        t0.tree_inv(),
+        t0.contains(parent),
+        idx < ENTRIES,
+        t1.store_wf(),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c != child && t0.contains(c)),
+        t1.node(parent) == t0.node(parent).update(idx, entry_absent()),
+        forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
+    ensures
+        t1.ad_pinned(),
+{
+    broadcast use lemma_node_struct_wf;
+
+    assert(t0.node(parent).e.dom().contains(idx));
+    assert(t1.entry(parent, idx) == entry_absent());
+    assert forall|n: PFN, i: nat| (n != child && (n != parent || i != idx)) implies
+        #[trigger] t1.entry(n, i) == t0.entry(n, i) by {
+        if n == parent {
+            assert(t1.node(parent).e[i] == t0.node(parent).e.insert(idx, entry_absent())[i]);
+        }
+    }
+    assert forall|n: PFN, i: nat|
+        (t1.contains(n) && i < ENTRIES && t1.node(n).e.dom().contains(i)) implies entry_pinned(
+            #[trigger] t1.entry(n, i),
+        ) by {
+        if n != parent || i != idx {
+            assert(t1.entry(n, i) == t0.entry(n, i));
+        }
+    }
+}
+
+/// The framework's preservation argument for unlinking and freeing an EMPTY
+/// child: if `t1` is `t0` with `parent[idx]` (an interior link to `child`) cleared
+/// and `child` removed from the store, then `t1` is still a valid tree. Kept THIN
+/// - each conjunct of `tree_inv` is discharged by a sub-lemma with its own small
+/// proof context, so no single check drowns in the combined quantifier set.
+#[verifier::rlimit(40)]
+pub proof fn lemma_unlink_free_preserves_tree_inv<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+)
+    requires
+        t0.store_wf(),
+        t0.tree_inv(),
+        t0.contains(parent),
+        idx < ENTRIES,
+        t0.interior_at(parent, idx),
+        t0.entry(parent, idx).target == child,
+        !(parent == t0.root() && idx == IDX_SELFMAP),
+        t0.node(child).empty(),
+        t1.store_wf(),
+        t1.root() == t0.root(),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c != child && t0.contains(c)),
+        t1.node(parent) == t0.node(parent).update(idx, entry_absent()),
+        forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
+    ensures
+        t1.tree_inv(),
+{
+    lemma_unlink_links_wf::<V>(t0, t1, parent, idx, child);
+    lemma_unlink_ad::<V>(t0, t1, parent, idx, child);
+    lemma_unlink_tree_wf::<V>(t0, t1, parent, idx, child);
+}
+
+/// Unlink and free an EMPTY child table, maintaining the table invariant. This is
+/// unmap's "shrink the tree" primitive: clear the parent's interior slot and
+/// reclaim the (now unreferenced, empty) child node. The caller proves only the
+/// local facts - the slot is an interior link to `child`, and `child` is empty -
+/// and the framework owns the tree argument.
+pub fn free_child<V: PtPage>(
+    parent_va: VA,
+    Ghost(parent): Ghost<PFN>,
+    idx: usize,
+    child_va: VA,
+    Ghost(child): Ghost<PFN>,
+    Tracked(perms): Tracked<&mut PageTablePerms<V>>,
+)
+    requires
+        old(perms).wf(),
+        parent_va == old(perms).node_va(parent),
+        child_va == old(perms).node_va(child),
+        idx < 512,
+        old(perms).contains(parent),
+        old(perms).interior_at(parent, idx as nat),
+        old(perms).entry(parent, idx as nat).target == child,
+        !(parent == old(perms).root() && idx as nat == IDX_SELFMAP),
+        old(perms).node(child).empty(),
+    ensures
+        final(perms).wf(),
+        final(perms).root() == old(perms).root(),
+        !final(perms).contains(child),
+        final(perms).node(parent) == old(perms).node(parent).update(idx as nat, entry_absent()),
+{
+    let ghost t0 = *perms;
+    // 1. clear the parent's interior slot.
+    let absent = V::make_absent();
+    let tracked parent_perm = perms.pages_.tracked_borrow_mut(parent);
+    node_set_entry::<V>(parent_va, Tracked(parent_perm), idx, absent);
+    // 2. remove the child from the store and free its page.
+    let tracked child_perm;
+    proof {
+        child_perm = perms.pages_.tracked_remove(child);
+    }
+    node_free::<V>(child_va, Tracked(child_perm));
+    // 3. re-establish the invariant.
+    proof {
+        broadcast use lemma_node_struct_wf, lemma_node_pfn;
+
+        let t1 = *perms;
+        assert(child != parent);
+        assert(t1.pages().dom() =~= t0.pages().dom().remove(child));
+        assert forall|c: PFN| #[trigger] t1.contains(c) <==> (c != child && t0.contains(c)) by {}
+        assert(t1.node(parent) == t0.node(parent).update(idx as nat, entry_absent()));
+        assert forall|m: PFN| m != child && m != parent implies #[trigger] t1.node(m) == t0.node(m)
+            by {}
+        assert forall|m: PFN| m != child implies #[trigger] t1.level(m) == t0.level(m) by {}
+        assert forall|p: PFN| t1.contains(p) implies (#[trigger] t1.pages()[p].wf()
+            && t1.pages()[p].pfn() == p) by {
+            assert(t0.contains(p));
+            if p != parent {
+                assert(t1.pages()[p] == t0.pages()[p]);
+            }
+        }
+        lemma_unlink_free_preserves_tree_inv::<V>(t0, t1, parent, idx as nat, child);
+    }
 }
 
 // =====================================================================

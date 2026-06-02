@@ -93,6 +93,16 @@ pub open spec fn pfn_of(pa: PA) -> nat {
     (pa.addr() as nat) / PAGE_SIZE
 }
 
+/// The PFN of a physical address as an executable `usize`. Trusted: a bit shift,
+/// equal to the spec `pfn_of`.
+#[verifier::external_body]
+pub fn pfn_of_pa(pa: PA) -> (pfn: usize)
+    ensures
+        pfn as nat == pfn_of(pa),
+{
+    pa.0 >> 12
+}
+
 /// `pa` is 4K-aligned.
 pub open spec fn pa_page_aligned(pa: PA) -> bool {
     (pa.addr() as nat) % PAGE_SIZE == 0
