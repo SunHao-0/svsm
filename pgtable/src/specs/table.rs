@@ -62,13 +62,15 @@ pub struct Walk {
 }
 
 /// One user-requested mapping: the base data frame `va` (the key in `va_map_`) is
-/// mapped to, the page size, and the confidentiality bit. Keyed by the mapping's
-/// *base* page, so one `map(va, pa, sz)` is one entry covering `size.pages()`
-/// frames. These are exactly the leaf-direct fields of a `Walk` (the accumulated
-/// `perm` is governed separately by `region_typed`, so it is not recorded here).
+/// mapped to, the page size, the effective access permission, and the
+/// confidentiality bit. Keyed by the mapping's *base* page, so one `map(va, pa, sz)`
+/// is one entry covering `size.pages()` frames. Because SVSM's interiors are
+/// permissive, the walk's accumulated `perm` reduces to the leaf's, so `perm` here
+/// is the leaf's own permission (`leaf_only_perm`).
 pub struct VMap {
     pub frame: PFN,
     pub size: PageSz,
+    pub perm: Perm,
     pub enc: bool,
 }
 
@@ -352,6 +354,32 @@ impl<V: PtPage> PageTablePerms<V> {
             ) == Some(n)
     }
 
+    /// SVSM builds every interior link PRESENT|WRITABLE|USER (NX clear), so interiors
+    /// never restrict the x86 walk and the leaf alone decides the permission. The
+    /// structural backing that lets `walk(vpn).perm` reduce to `leaf_only_perm`.
+    pub open spec fn interiors_permissive(self) -> bool {
+        forall|n: PFN, idx: nat| #[trigger] self.interior_at(n, idx) ==> permissive(self.entry(n, idx))
+    }
+
+    /// The base virtual page of node `n` is aligned to its own coverage stride
+    /// (`span(level(n)+1)` pages), so each entry's base is a multiple of `span(level)`
+    /// and `vpn % span(level)` is the in-entry offset. Maintained structurally.
+    pub open spec fn xlate_base_aligned(self) -> bool {
+        forall|n: PFN| #[trigger]
+            self.contains(n) ==> self.xlate_base(n) % span((self.level(n) + 1) as nat) == 0
+    }
+
+    /// The LOCAL base relationship (the easy-to-preserve form of `xlate_base`
+    /// correctness): the root is based at 0, and every interior link sets its child's
+    /// base to the entry's base. `reflects_walk` is *derived* from this + `tree_inv`
+    /// by `lemma_reflects_walk`, so the structural ops only maintain this local fact.
+    pub open spec fn xlate_base_consistent(self) -> bool {
+        &&& self.xlate_base(self.root()) == 0
+        &&& forall|p: PFN, idx: nat| #[trigger]
+            self.interior_at(p, idx) ==> self.xlate_base(self.entry(p, idx).target)
+                == self.entry_vpn_base(p, idx)
+    }
+
     // --- the user-mapping coupling -----------------------------------
     /// Does mapping `m` based at vpn `b` cover `vpn` (i.e. `vpn` in its range)?
     pub open spec fn vmap_covers(b: VPage, m: VMap, vpn: VPage) -> bool {
@@ -362,8 +390,7 @@ impl<V: PtPage> PageTablePerms<V> {
     /// walk resolves, one-to-one. Not yet part of `wf` - wired in once the bridge
     /// lemma and `map`/`unmap` preservation are proven.
     pub open spec fn mapping_inv(self) -> bool {
-        // (A) COMPLETE: every recorded mapping is realized by the walk, page by page
-        // (leaf-direct fields: frame, size, enc; the accumulated perm is region_typed).
+        // (A) COMPLETE: every recorded mapping is realized by the walk, page by page.
         &&& forall|b: VPage| #[trigger]
             self.va_map().dom().contains(b) ==> {
                 let m = self.va_map()[b];
@@ -374,6 +401,7 @@ impl<V: PtPage> PageTablePerms<V> {
                     &&& w is Some
                     &&& w->Some_0.frame == (m.frame + k) as nat
                     &&& w->Some_0.size == m.size
+                    &&& w->Some_0.perm == m.perm
                     &&& w->Some_0.enc == m.enc
                 }
             }
@@ -530,6 +558,146 @@ impl<V: PtPage> PageTablePerms<V> {
 // The walk <-> path bridge: turn the global `walk` into a local leaf fact
 // =====================================================================
 
+/// Arithmetic: a vpn inside entry `idx`'s sub-range of a node based at `base`
+/// (aligned to the node's stride `s2 = 512*s1`) has page-table index `idx` at the
+/// node's level (`s1 = span(level)`). The numeric heart of `lemma_node_on_path_eq`.
+pub proof fn lemma_pt_index_in_entry(base: nat, s1: nat, s2: nat, idx: nat, vpn: nat)
+    requires
+        s1 > 0,
+        s2 == 512 * s1,
+        idx < 512,
+        base % s2 == 0,
+        base + idx * s1 <= vpn,
+        vpn < base + idx * s1 + s1,
+    ensures
+        (vpn / s1) % 512 == idx,
+{
+    let q = base / s2;
+    assert(base == s2 * q) by {
+        vstd::arithmetic::div_mod::lemma_fundamental_div_mod(base as int, s2 as int);
+    }
+    let r = (vpn - (base + idx * s1)) as nat;
+    assert(vpn == s1 * (512 * q + idx) + r) by (nonlinear_arith)
+        requires
+            base == s2 * q,
+            s2 == 512 * s1,
+            vpn == base + idx * s1 + r,
+    ;
+    assert((vpn / s1) == 512 * q + idx) by {
+        vstd::arithmetic::div_mod::lemma_div_multiples_vanish_fancy(
+            (512 * q + idx) as int,
+            r as int,
+            s1 as int,
+        );
+    }
+    assert((512 * q + idx) % 512 == idx) by (nonlinear_arith)
+        requires
+            idx < 512,
+    ;
+}
+
+/// `span` is always positive (every level covers at least one page).
+pub proof fn lemma_span_pos(level: nat)
+    ensures
+        span(level) > 0,
+    decreases level,
+{
+    if level == 0 {
+    } else {
+        lemma_span_pos((level - 1) as nat);
+    }
+}
+
+/// The structural derivation: a live node sits at the end of the walk path for the
+/// vpns in its range. Proven by walking UP from `n` to the root - each step uses
+/// connectivity (the unique parent interior link) and `xlate_base_consistent` to
+/// pin the parent index, with `lemma_pt_index_in_entry` doing the arithmetic. This
+/// is why the structural ops only maintain the LOCAL `xlate_base_consistent`.
+#[verifier::rlimit(50)]
+pub proof fn lemma_node_on_path_eq<V: PtPage>(t: PageTablePerms<V>, n: PFN, vpn: VPage)
+    requires
+        t.store_wf(),
+        t.contains(t.root()),
+        t.tree_inv(),
+        t.xlate_base_consistent(),
+        t.xlate_base_aligned(),
+        t.contains(n),
+        t.node_covers(n, vpn),
+    ensures
+        t.node_on_path(vpn, t.level(n)) == Some(n),
+    decreases ROOT_LEVEL - t.level(n),
+{
+    broadcast use lemma_node_struct_wf, lemma_node_level_bound;
+
+    let l = t.level(n);
+    assert(t.pages()[n].wf());  // store_wf => the node level bound applies
+    if l >= ROOT_LEVEL {
+        assert(l == ROOT_LEVEL);
+        assert(n == t.root());  // tree_wf: unique top-level node
+    } else {
+        // connectivity: n has a (unique) parent interior link (p, idx).
+        assert(t.tree_wf());
+        let (p, idx): (PFN, nat) = choose|p: PFN, idx: nat|
+            #![trigger t.interior_at(p, idx)]
+            t.interior_at(p, idx) && t.entry(p, idx).target == n;
+        assert(t.interior_at(p, idx) && t.entry(p, idx).target == n);
+        assert(t.contains(p) && idx < ENTRIES);
+        // node_wf(p): the link is not the self-map (its target is the root, != n
+        // since n is below the top), so it drops exactly one level.
+        assert(t.node_wf(p));
+        assert(n != t.root());
+        assert(!t.is_self_map(p, idx));
+        assert(t.level(p) == l + 1);
+        // xlate_base_consistent pins n's base to the entry's base.
+        assert(t.xlate_base(n) == t.entry_vpn_base(p, idx));
+        assert(t.entry_vpn_base(p, idx) == t.xlate_base(p) + idx * span((l + 1) as nat));
+        lemma_span_pos((l + 1) as nat);
+        assert(span((l + 2) as nat) == 512 * span((l + 1) as nat));
+        // n's range sits inside p's range, so p covers vpn too.
+        assert(t.node_covers(p, vpn)) by {
+            assert((idx + 1) * span((l + 1) as nat) <= 512 * span((l + 1) as nat))
+                by (nonlinear_arith)
+                requires
+                    idx < 512,
+                    span((l + 1) as nat) >= 0,
+            ;
+        }
+        lemma_node_on_path_eq::<V>(t, p, vpn);
+        assert(t.node_on_path(vpn, l + 1) == Some(p));
+        // The page-table index at p's level is exactly idx, so the path takes the
+        // interior link into n.
+        assert(pt_index(vpn, (l + 1) as nat) == idx) by {
+            assert(t.xlate_base(p) % span((l + 2) as nat) == 0);  // xlate_base_aligned
+            lemma_pt_index_in_entry(
+                t.xlate_base(p),
+                span((l + 1) as nat),
+                span((l + 2) as nat),
+                idx,
+                vpn,
+            );
+        }
+        assert(t.interior_at(p, pt_index(vpn, (l + 1) as nat)));
+    }
+}
+
+/// Wrap the per-node derivation into the `reflects_walk` predicate `lemma_leaf_walk`
+/// consumes - so `wf` need only carry the local `xlate_base_consistent`.
+pub proof fn lemma_reflects_walk<V: PtPage>(t: PageTablePerms<V>)
+    requires
+        t.store_wf(),
+        t.contains(t.root()),
+        t.tree_inv(),
+        t.xlate_base_consistent(),
+        t.xlate_base_aligned(),
+    ensures
+        t.xlate_base_reflects_walk(),
+{
+    assert forall|n: PFN, vpn: VPage| (t.contains(n) && t.node_covers(n, vpn)) implies
+        t.node_on_path(vpn, t.level(n)) == Some(n) by {
+        lemma_node_on_path_eq::<V>(t, n, vpn);
+    }
+}
+
 /// The keystone induction: the full `walk` from the root reaches the node the
 /// path function names at `level`, with the accumulator the path function names.
 /// Proven by induction down from the root; each step consumes one present interior
@@ -567,14 +735,42 @@ pub proof fn lemma_walk_follows_path<V: PtPage>(t: PageTablePerms<V>, vpn: VPage
     }
 }
 
+/// Every interior link on the path is permissive (`interiors_permissive`), so the
+/// x86 accumulator stays at the identity all the way down: the leaf alone decides
+/// the permission. The induction backing the `perm` half of `lemma_leaf_walk`.
+pub proof fn lemma_path_acc_identity<V: PtPage>(t: PageTablePerms<V>, vpn: VPage, level: nat)
+    requires
+        t.contains(t.root()),
+        t.links_wf(),
+        t.interiors_permissive(),
+        level <= ROOT_LEVEL,
+        t.node_on_path(vpn, level) is Some,
+    ensures
+        t.path_acc(vpn, level) == perm_identity(),
+    decreases ROOT_LEVEL - level,
+{
+    if level >= ROOT_LEVEL {
+        // Base: path_acc at the root is the identity - definitional.
+    } else {
+        lemma_path_acc_identity::<V>(t, vpn, level + 1);
+        let p = t.node_on_path(vpn, level + 1)->Some_0;
+        let pidx = pt_index(vpn, level + 1);
+        assert(t.interior_at(p, pidx));  // node_on_path(level) Some
+        assert(permissive(t.entry(p, pidx)));  // interiors_permissive
+        lemma_permissive_keeps_top(t.entry(p, pidx));
+    }
+}
+
 /// The local bridge `map`/`unmap` use: at a node the path reaches, a leaf entry
-/// yields a concrete `walk` result whose leaf-direct fields (frame/size/enc) are
-/// determined by the entry. Couples a single leaf write to `walk(vpn)`.
+/// fixes the whole `walk` result. Leaf-direct fields (frame/size/enc) come straight
+/// from the entry; `perm` reduces to the leaf's own (`leaf_only_perm`) because the
+/// interiors on the path are permissive. Couples a single leaf write to `walk(vpn)`.
 pub proof fn lemma_leaf_walk<V: PtPage>(t: PageTablePerms<V>, n: PFN, idx: nat, vpn: VPage)
     requires
         t.contains(t.root()),
         t.links_wf(),
         t.xlate_base_reflects_walk(),
+        t.interiors_permissive(),
         t.contains(n),
         t.node_covers(n, vpn),
         idx == pt_index(vpn, t.level(n)),
@@ -583,14 +779,18 @@ pub proof fn lemma_leaf_walk<V: PtPage>(t: PageTablePerms<V>, n: PFN, idx: nat, 
         t.walk(vpn) is Some,
         t.walk(vpn)->Some_0.frame == (t.entry(n, idx).target + vpn % span(t.level(n))) as nat,
         t.walk(vpn)->Some_0.size == size_of_level(t.level(n)),
+        t.walk(vpn)->Some_0.perm == leaf_only_perm(t.entry(n, idx)),
         t.walk(vpn)->Some_0.enc == t.entry(n, idx).enc,
 {
     let l = t.level(n);
     // reflects_walk: the path reaches exactly this node for vpn.
     assert(t.node_on_path(vpn, l) == Some(n));
     lemma_walk_follows_path::<V>(t, vpn, l);
-    // walk_from(n, l, vpn, acc) reads the leaf entry (present, leaf-or-level-0).
+    // The accumulated permission is the identity (permissive interiors), so the leaf
+    // entry decides frame/size/enc/perm.
+    lemma_path_acc_identity::<V>(t, vpn, l);
     assert(t.entry(n, pt_index(vpn, l)).present);
+    lemma_top_combine_is_leaf_only(t.entry(n, idx));
 }
 
 // =====================================================================
