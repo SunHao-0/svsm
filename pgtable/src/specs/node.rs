@@ -132,6 +132,27 @@ impl PTNode {
     }
 }
 
+/// The abstract interior entry SVSM installs to link a child table at frame
+/// `child`: present, NOT a leaf, *permissive* (writable/user, executable) and
+/// *A/D-pinned*, encrypted. Permissive interiors don't restrict the x86 walk (so
+/// the leaf decides the permission), and A/D-pinning neutralizes the MMU's
+/// ACCESSED write. (Flavor-specific: a Linux interior would set different flags;
+/// `make_interior` is where the concrete bit pattern is built.)
+pub open spec fn interior_entry(child: PFN) -> Entry {
+    Entry {
+        present: true,
+        leaf: false,
+        target: child,
+        w: true,
+        user: true,
+        nx: false,
+        global: false,
+        enc: true,
+        accessed: true,
+        dirty: true,
+    }
+}
+
 // =====================================================================
 // The mapping trait: a page-table page maps to an abstract `PTNode`
 // =====================================================================
@@ -188,6 +209,14 @@ pub trait PtPage: Sized {
         ensures
             final(self).view() == old(self).view().update(i as nat, Self::decode(pte)),
     ;
+
+    /// Build the concrete entry that links a child table at frame `child` - the
+    /// PTE bits whose decoding is `interior_entry(child)`. Only the author knows
+    /// the architectural layout, so the structural operations get it from here.
+    fn make_interior(child: usize) -> (pte: Self::Pte)
+        ensures
+            Self::decode(pte) == interior_entry(child as nat),
+    ;
 }
 
 /// Every page of a given `PtPage` type maps to a structurally well-formed node.
@@ -211,6 +240,16 @@ pub broadcast proof fn lemma_node_struct_wf<V: PtPage>(perm: PTNodePerm<V>)
         (#[trigger] perm.node()).wf(),
 {
     perm.perm.value().view_wf();
+}
+
+/// A well-formed node permission sits at a real paging level (<= ROOT_LEVEL).
+/// Broadcast so the table layer can use it past the closed `PTNodePerm::wf`.
+pub broadcast proof fn lemma_node_level_bound<V: PtPage>(perm: PTNodePerm<V>)
+    requires
+        perm.wf(),
+    ensures
+        (#[trigger] perm.level()) <= ROOT_LEVEL,
+{
 }
 
 // =====================================================================

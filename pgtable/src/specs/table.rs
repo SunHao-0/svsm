@@ -19,8 +19,9 @@
 //
 // Compiled only under verification (`verus_only`).
 use crate::specs::node::{
-    ENTRIES, Entry, PFN, PTNode, PTNodePerm, PageSz, PtPage, ROOT_LEVEL, VPage, lemma_node_struct_wf,
-    node_alloc, node_free, node_read_entry, node_set_entry, pt_index, size_of_level, span,
+    ENTRIES, Entry, PFN, PTNode, PTNodePerm, PageSz, PtPage, ROOT_LEVEL, VPage, interior_entry,
+    lemma_node_level_bound, lemma_node_struct_wf, node_alloc, node_free, node_read_entry,
+    node_set_entry, pt_index, size_of_level, span,
 };
 use crate::specs::perm::{PA, VA};
 use crate::stubs::SvsmError;
@@ -508,7 +509,9 @@ pub proof fn lemma_leaf_write_preserves_tree_inv<V: PtPage>(
         t1.contains(c) implies exists|n: PFN, i: nat|
         #[trigger] t1.interior_at(n, i) && t1.entry(n, i).target == c by {
         assert(t0.contains(c));
-        let w = choose|n: PFN, i: nat| t0.interior_at(n, i) && t0.entry(n, i).target == c;
+        let w = choose|n: PFN, i: nat|
+            #![trigger t0.interior_at(n, i)]
+            t0.interior_at(n, i) && t0.entry(n, i).target == c;
         assert(t1.interior_at(w.0, w.1));
     }
     assert(t1.tree_wf());
@@ -581,6 +584,251 @@ pub fn table_set_entry<V: PtPage>(
         }
         lemma_leaf_write_preserves_tree_inv::<V>(t0, t1, pfn, idx as nat, e);
     }
+}
+
+/// Allocate a fresh, empty page-table node at paging `level`, distinct from every
+/// node already in `perms`. Freshness w.r.t. the store is the trusted allocator
+/// boundary: the global allocator never hands back a frame the page table already
+/// owns (the owned frames are exactly `perms.pages().dom()`). Returns the access
+/// `VA`, the child PFN as an exec `usize`, and the owning node permission.
+#[verifier::external_body]
+pub fn table_alloc_fresh<V: PtPage>(
+    level: usize,
+    Tracked(perms): Tracked<&PageTablePerms<V>>,
+) -> (r: Result<(VA, usize, Tracked<PTNodePerm<V>>), SvsmError>)
+    requires
+        level <= 3,
+    ensures
+        r matches Ok((va, pfn, perm)) ==> {
+            &&& perm@.wf()
+            &&& perm@.node().empty()
+            &&& perm@.level() == level as nat
+            &&& perm@.va() == va
+            &&& perm@.pfn() == pfn as nat
+            &&& !perms.contains(pfn as nat)
+        },
+{
+    let (va, pa, perm) = match node_alloc::<V>(level) {
+        Ok(t) => t,
+        Err(e) => return Err(e),
+    };
+    let pfn = pa.0 >> 12;
+    Ok((va, pfn, perm))
+}
+
+/// The framework's preservation argument for linking a FRESH child: if `t1` is
+/// `t0` with a fresh, empty child node inserted (at `level(parent)-1`) and
+/// `parent[idx]` - previously absent - set to `interior_entry(child)`, then `t1`
+/// is still a valid tree. Freshness is the crux: because `child` was not in `t0`,
+/// no existing interior entry targets it (their targets are live nodes), so the
+/// new link is `child`'s unique parent (injectivity) and gives it connectivity.
+#[verifier::rlimit(60)]
+pub proof fn lemma_link_child_preserves_tree_inv<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+)
+    requires
+        t0.store_wf(),
+        t0.tree_inv(),
+        t0.contains(parent),
+        idx < ENTRIES,
+        t0.level(parent) >= 1,
+        !t0.node(parent).e[idx].present,
+        !(parent == t0.root() && idx == IDX_SELFMAP),
+        !t0.contains(child),
+        t1.store_wf(),
+        t1.root() == t0.root(),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c == child || t0.contains(c)),
+        t1.node(child).empty(),
+        t1.level(child) == t0.level(parent) - 1,
+        t1.node(parent) == t0.node(parent).update(idx, interior_entry(child)),
+        t1.level(parent) == t0.level(parent),
+        forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
+    ensures
+        t1.tree_inv(),
+{
+    broadcast use lemma_node_struct_wf, lemma_node_level_bound;
+
+    let r = t0.root();
+    let ei = interior_entry(child);
+    assert(child != parent && child != r);
+    assert(t0.node(parent).e.dom().contains(idx));
+    assert(t0.level(parent) <= ROOT_LEVEL);
+    assert(t1.level(child) < ROOT_LEVEL);
+
+    // Entries: unchanged except (parent, idx) -> ei; child's entries are all absent.
+    assert forall|n: PFN, i: nat| (n != parent || i != idx) && n != child implies
+        #[trigger] t1.entry(n, i) == t0.entry(n, i) by {
+        if n == parent {
+            assert(t1.node(parent).e[i] == t0.node(parent).e.insert(idx, ei)[i]);
+        }
+    }
+    assert(t1.entry(parent, idx) == ei);
+    // interior_at: gains (parent, idx); child has none; unchanged elsewhere.
+    assert(t1.interior_at(parent, idx));
+    assert forall|i: nat| !#[trigger] t1.interior_at(child, i) by {}
+    assert forall|n: PFN, i: nat| (n != parent || i != idx) implies
+        #[trigger] t1.interior_at(n, i) == t0.interior_at(n, i) by {
+        if n != child {
+            assert(t1.entry(n, i) == t0.entry(n, i));
+        } else {
+            assert(!t1.interior_at(child, i));
+            assert(!t0.interior_at(child, i));
+        }
+    }
+    // A t0 interior entry targets a live t0 node (via node_wf), hence not `child`.
+    assert forall|n: PFN, i: nat| t0.interior_at(n, i) implies
+        (#[trigger] t0.contains(t0.entry(n, i).target) && t0.entry(n, i).target != child) by {
+        assert(t0.node_wf(n));
+    }
+
+    // --- tree_wf, clause by clause -----------------------------------
+    assert forall|n: PFN| #![trigger t1.contains(n)]
+        t1.contains(n) && t1.level(n) == ROOT_LEVEL implies n == r by {
+        if n != child {
+            assert(t0.contains(n));
+        }
+    }
+    assert(t1.interior_at(r, IDX_SELFMAP));
+    assert(t1.entry(r, IDX_SELFMAP) == t0.entry(r, IDX_SELFMAP));
+    // injectivity: each interior entry of t1 is (parent,idx)->child, or a t0
+    // interior with target in t0's store (so != child) - the two never collide.
+    assert forall|n1: PFN, i1: nat, n2: PFN, i2: nat|
+        (#[trigger] t1.interior_at(n1, i1) && #[trigger] t1.interior_at(n2, i2) && t1.entry(
+            n1,
+            i1,
+        ).target == t1.entry(n2, i2).target) implies (n1 == n2 && i1 == i2) by {
+        if (n1 == parent && i1 == idx) && !(n2 == parent && i2 == idx) {
+            assert(t0.interior_at(n2, i2) && t1.entry(n2, i2) == t0.entry(n2, i2));
+        } else if !(n1 == parent && i1 == idx) && (n2 == parent && i2 == idx) {
+            assert(t0.interior_at(n1, i1) && t1.entry(n1, i1) == t0.entry(n1, i1));
+        } else if !(n1 == parent && i1 == idx) && !(n2 == parent && i2 == idx) {
+            assert(t0.interior_at(n1, i1) && t1.entry(n1, i1) == t0.entry(n1, i1));
+            assert(t0.interior_at(n2, i2) && t1.entry(n2, i2) == t0.entry(n2, i2));
+        }
+    }
+    // connectivity: child's parent is (parent, idx); t0 nodes keep their parents.
+    assert forall|c: PFN| #![trigger t1.contains(c)]
+        t1.contains(c) implies exists|n: PFN, i: nat|
+        #[trigger] t1.interior_at(n, i) && t1.entry(n, i).target == c by {
+        if c == child {
+            assert(t1.interior_at(parent, idx) && t1.entry(parent, idx).target == child);
+        } else {
+            assert(t0.contains(c));
+            let w = choose|n: PFN, i: nat|
+                #![trigger t0.interior_at(n, i)]
+                t0.interior_at(n, i) && t0.entry(n, i).target == c;
+            assert(t1.interior_at(w.0, w.1) && t1.entry(w.0, w.1).target == c);
+        }
+    }
+    assert(t1.tree_wf());
+
+    // links resolve.
+    assert forall|n: PFN| t1.contains(n) implies #[trigger] t1.node_wf(n) by {
+        if n == child {
+        } else if n == parent {
+            assert(t0.node_wf(parent));
+        } else {
+            assert(t0.node_wf(n));
+        }
+    }
+    // A/D pinned: the new interior entry is pinned; child's are absent; rest fixed.
+    assert forall|n: PFN, i: nat|
+        (t1.contains(n) && i < ENTRIES && t1.node(n).e.dom().contains(i)) implies entry_pinned(
+            #[trigger] t1.entry(n, i),
+        ) by {
+        if (n != parent || i != idx) && n != child {
+            assert(t1.entry(n, i) == t0.entry(n, i));
+        }
+    }
+}
+
+/// Allocate a fresh child table and link it under the absent slot `parent[idx]`,
+/// maintaining the table invariant. This is map's "grow the tree" primitive: the
+/// caller (a walk that hit an absent interior slot) passes the parent and the
+/// level it is at, and gets back the new child's access `VA` and PFN to descend
+/// into. The caller proves only the local slot/level facts; the framework owns the
+/// freshness + tree argument (`lemma_link_child_preserves_tree_inv`).
+pub fn alloc_child<V: PtPage>(
+    parent_va: VA,
+    Ghost(parent): Ghost<PFN>,
+    parent_level: usize,
+    idx: usize,
+    Tracked(perms): Tracked<&mut PageTablePerms<V>>,
+) -> (r: Result<(VA, usize), SvsmError>)
+    requires
+        old(perms).wf(),
+        parent_va == old(perms).node_va(parent),
+        parent_level as nat == old(perms).level(parent),
+        parent_level >= 1,
+        idx < 512,
+        old(perms).contains(parent),
+        !old(perms).node(parent).e[idx as nat].present,
+        !(parent == old(perms).root() && idx as nat == IDX_SELFMAP),
+    ensures
+        final(perms).wf(),
+        final(perms).root() == old(perms).root(),
+        r matches Ok((child_va, child_pfn)) ==> {
+            &&& !old(perms).contains(child_pfn as nat)
+            &&& final(perms).contains(child_pfn as nat)
+            &&& final(perms).level(child_pfn as nat) == old(perms).level(parent) - 1
+            &&& final(perms).node(child_pfn as nat).empty()
+            &&& child_va == final(perms).node_va(child_pfn as nat)
+            &&& final(perms).node(parent) == old(perms).node(parent).update(
+                idx as nat,
+                interior_entry(child_pfn as nat),
+            )
+        },
+        r matches Err(_) ==> *final(perms) == *old(perms),
+{
+    let ghost t0 = *perms;
+    proof {
+        broadcast use lemma_node_level_bound;
+        assert(perms.level(parent) <= ROOT_LEVEL);
+    }
+    let (child_va, child_pfn, child_perm_t) = match table_alloc_fresh::<V>(
+        parent_level - 1,
+        Tracked(&*perms),
+    ) {
+        Ok(t) => t,
+        Err(e) => return Err(e),
+    };
+    let Tracked(child_perm) = child_perm_t;
+    proof {
+        perms.pages_.tracked_insert(child_pfn as nat, child_perm);
+    }
+    let pte = V::make_interior(child_pfn);
+    let tracked parent_perm = perms.pages_.tracked_borrow_mut(parent);
+    node_set_entry::<V>(parent_va, Tracked(parent_perm), idx, pte);
+    proof {
+        broadcast use lemma_node_struct_wf;
+
+        let t1 = *perms;
+        let ghost cp = child_pfn as nat;
+        // The store is t0 with `child` inserted and `parent[idx]` linked.
+        assert(t1.pages().dom() =~= t0.pages().dom().insert(cp));
+        assert forall|c: PFN| #[trigger] t1.contains(c) <==> (c == cp || t0.contains(c)) by {}
+        assert(t1.node(cp).empty());
+        assert(t1.node(cp).e.dom().contains(0) || true);
+        assert(t1.node(parent) == t0.node(parent).update(idx as nat, interior_entry(cp)));
+        assert forall|m: PFN| m != cp && m != parent implies #[trigger] t1.node(m) == t0.node(m)
+            by {}
+        assert forall|m: PFN| m != cp implies #[trigger] t1.level(m) == t0.level(m) by {}
+        // store_wf survives.
+        assert forall|p: PFN| t1.contains(p) implies (#[trigger] t1.pages()[p].wf()
+            && t1.pages()[p].pfn() == p) by {
+            if p != cp && p != parent {
+                assert(t0.contains(p));
+                assert(t1.pages()[p] == t0.pages()[p]);
+            }
+        }
+        lemma_link_child_preserves_tree_inv::<V>(t0, t1, parent, idx as nat, cp);
+    }
+    Ok((child_va, child_pfn))
 }
 
 // =====================================================================
