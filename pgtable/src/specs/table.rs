@@ -61,6 +61,17 @@ pub struct Walk {
     pub global: bool,
 }
 
+/// One user-requested mapping: the base data frame `va` (the key in `va_map_`) is
+/// mapped to, the page size, and the confidentiality bit. Keyed by the mapping's
+/// *base* page, so one `map(va, pa, sz)` is one entry covering `size.pages()`
+/// frames. These are exactly the leaf-direct fields of a `Walk` (the accumulated
+/// `perm` is governed separately by `region_typed`, so it is not recorded here).
+pub struct VMap {
+    pub frame: PFN,
+    pub size: PageSz,
+    pub enc: bool,
+}
+
 /// The effective permission is combined over EVERY entry on the walk (parents +
 /// leaf). The rule is architecture specific: x86 intersects (AND), an ARM-like
 /// arch unions (OR).
@@ -108,14 +119,23 @@ pub open spec fn leaf_only_perm(e: Entry) -> Perm {
 // The page table: a permission collection + its mapped-frame footprint
 // =====================================================================
 /// All page-table-node permissions of one page table, keyed by physical frame,
-/// the root frame (CR3), and the set of data frames the leaves map (`frames_`).
+/// the root frame (CR3), plus the ghost record of the user-requested mappings.
 /// Owning the permissions - not just a view - is what makes this the page table
-/// rather than a snapshot of it; `frames_` is the analogue for the data pages it
-/// refers to.
+/// rather than a snapshot of it.
+///
+/// The mapping bookkeeping (replacing the old `frames_: Set<PFN>`, which lost the
+/// va<->pa association):
+///   * `xlate_base_` - the base virtual page each node translates (its vpn prefix),
+///     maintained structurally; it turns the global `walk` into a local leaf fact.
+///   * `va_map_` - the user-requested mappings, keyed by base virtual page.
+/// `mapping_inv` couples these to the actual `walk`; one-to-one (each frame used by
+/// at most one mapping) is a disjointness clause on `va_map_`, so no separate
+/// inverse map is stored.
 pub tracked struct PageTablePerms<V: PtPage> {
     ghost root_: PFN,
     tracked pages_: Map<PFN, PTNodePerm<V>>,
-    ghost frames_: Set<PFN>,
+    ghost xlate_base_: Map<PFN, VPage>,
+    ghost va_map_: Map<VPage, VMap>,
 }
 
 impl<V: PtPage> PageTablePerms<V> {
@@ -127,11 +147,14 @@ impl<V: PtPage> PageTablePerms<V> {
         self.pages_
     }
 
-    /// The tracked set of normal/huge data frames the leaves of this table map
-    /// (NOT page-table pages, which are `pages().dom()`). `wf` ties it to the
-    /// actual leaf entries (`mapped_frames`).
-    pub closed spec fn frames(self) -> Set<PFN> {
-        self.frames_
+    /// The base virtual page node `n` translates (the vpn prefix of its subtree).
+    pub closed spec fn xlate_base(self, n: PFN) -> VPage {
+        self.xlate_base_[n]
+    }
+
+    /// The user-requested mappings, keyed by each mapping's base virtual page.
+    pub closed spec fn va_map(self) -> Map<VPage, VMap> {
+        self.va_map_
     }
 
     /// Is `p` a live page-table node of this table?
@@ -265,6 +288,118 @@ impl<V: PtPage> PageTablePerms<V> {
         self.walk_from(self.root(), ROOT_LEVEL, vpn, perm_identity())
     }
 
+    // --- the translation base: which vpns each node/entry covers -----
+    /// The node the walk for `vpn` visits at `level` (descending interior links
+    /// from the root), or `None` if an interior link is missing before then. This
+    /// is the *structural* path; `xlate_base_reflects_walk` ties it to `xlate_base`.
+    pub open spec fn node_on_path(self, vpn: VPage, level: nat) -> Option<PFN>
+        decreases ROOT_LEVEL - level,
+    {
+        if level >= ROOT_LEVEL {
+            Some(self.root())
+        } else {
+            match self.node_on_path(vpn, level + 1) {
+                Some(p) => if self.interior_at(p, pt_index(vpn, level + 1)) {
+                    Some(self.entry(p, pt_index(vpn, level + 1)).target)
+                } else {
+                    None
+                },
+                None => None,
+            }
+        }
+    }
+
+    /// The permission the walk for `vpn` has accumulated by the time it reaches
+    /// `level` (mirrors `node_on_path`); the accumulator argument of `walk_from`
+    /// at the node `node_on_path(vpn, level)`.
+    pub open spec fn path_acc(self, vpn: VPage, level: nat) -> Perm
+        decreases ROOT_LEVEL - level,
+    {
+        if level >= ROOT_LEVEL {
+            perm_identity()
+        } else {
+            match self.node_on_path(vpn, level + 1) {
+                Some(p) => combine_step(
+                    self.path_acc(vpn, level + 1),
+                    self.entry(p, pt_index(vpn, level + 1)),
+                ),
+                None => perm_identity(),
+            }
+        }
+    }
+
+    /// The base virtual page that entry `idx` of node `n` translates: the node's
+    /// base plus `idx` strides of one entry's coverage (`span(level(n))` pages).
+    pub open spec fn entry_vpn_base(self, n: PFN, idx: nat) -> VPage {
+        (self.xlate_base(n) + idx * span(self.level(n))) as nat
+    }
+
+    /// Is `vpn` inside node `n`'s translated range (`span(level(n)+1)` pages)?
+    pub open spec fn node_covers(self, n: PFN, vpn: VPage) -> bool {
+        self.xlate_base(n) <= vpn < self.xlate_base(n) + span((self.level(n) + 1) as nat)
+    }
+
+    /// `xlate_base` is faithful: every live node sits at the end of the walk path
+    /// for exactly the vpns in its range. The structural backing of `mapping_inv`,
+    /// maintained by the structural ops (it is about interior links, so leaf writes
+    /// leave it alone) and the bridge from a leaf entry to a concrete `walk` result.
+    pub open spec fn xlate_base_reflects_walk(self) -> bool {
+        forall|n: PFN, vpn: VPage|
+            #![trigger self.node_covers(n, vpn)]
+            (self.contains(n) && self.node_covers(n, vpn)) ==> self.node_on_path(
+                vpn,
+                self.level(n),
+            ) == Some(n)
+    }
+
+    // --- the user-mapping coupling -----------------------------------
+    /// Does mapping `m` based at vpn `b` cover `vpn` (i.e. `vpn` in its range)?
+    pub open spec fn vmap_covers(b: VPage, m: VMap, vpn: VPage) -> bool {
+        b <= vpn < b + m.size.pages()
+    }
+
+    /// The user-mapping invariant: `va_map`/`pa_map` faithfully record what the
+    /// walk resolves, one-to-one. Not yet part of `wf` - wired in once the bridge
+    /// lemma and `map`/`unmap` preservation are proven.
+    pub open spec fn mapping_inv(self) -> bool {
+        // (A) COMPLETE: every recorded mapping is realized by the walk, page by page
+        // (leaf-direct fields: frame, size, enc; the accumulated perm is region_typed).
+        &&& forall|b: VPage| #[trigger]
+            self.va_map().dom().contains(b) ==> {
+                let m = self.va_map()[b];
+                &&& b % m.size.pages() == 0
+                &&& m.frame % m.size.pages() == 0
+                &&& forall|k: nat| k < m.size.pages() ==> {
+                    let w = (#[trigger] self.walk((b + k) as nat));
+                    &&& w is Some
+                    &&& w->Some_0.frame == (m.frame + k) as nat
+                    &&& w->Some_0.size == m.size
+                    &&& w->Some_0.enc == m.enc
+                }
+            }
+        // (B) SOUND: every user-region walk leaf-resolution is a recorded mapping
+        // (the self-map subtree is excluded - it resolves PT pages, not user data).
+        &&& forall|vpn: VPage|
+            #![trigger self.walk(vpn)]
+            (self.walk(vpn) is Some && in_user_region(vpn)) ==> exists|b: VPage|
+                #![trigger self.va_map().dom().contains(b)]
+                self.va_map().dom().contains(b) && Self::vmap_covers(b, self.va_map()[b], vpn)
+        // (C) one-to-one: distinct mappings use disjoint data-frame ranges (the
+        // pa side of the bijection, kept as a clause on `va_map_` - no inverse map).
+        &&& forall|b1: VPage, b2: VPage|
+            (b1 != b2 && #[trigger] self.va_map().dom().contains(b1)
+                && #[trigger] self.va_map().dom().contains(b2)) ==> {
+                let f1 = self.va_map()[b1].frame;
+                let f2 = self.va_map()[b2].frame;
+                f1 + self.va_map()[b1].size.pages() <= f2 || f2 + self.va_map()[b2].size.pages() <= f1
+            }
+        // (D) ranges disjoint: distinct mappings cover disjoint vpn ranges.
+        &&& forall|b1: VPage, b2: VPage|
+            (b1 != b2 && #[trigger] self.va_map().dom().contains(b1)
+                && #[trigger] self.va_map().dom().contains(b2)) ==> (b1 + self.va_map()[b1].size.pages()
+                <= b2 || b2 + self.va_map()[b2].size.pages() <= b1)
+    }
+
     // --- structural well-formedness ----------------------------------
     /// The recursive self-map slot: the root's entry that points back to the root.
     pub open spec fn is_self_map(self, n: PFN, idx: nat) -> bool {
@@ -389,6 +524,73 @@ impl<V: PtPage> PageTablePerms<V> {
                 (!w.enc) <==> walk_frames(w).subset_of(host_shared)
             }
     }
+}
+
+// =====================================================================
+// The walk <-> path bridge: turn the global `walk` into a local leaf fact
+// =====================================================================
+
+/// The keystone induction: the full `walk` from the root reaches the node the
+/// path function names at `level`, with the accumulator the path function names.
+/// Proven by induction down from the root; each step consumes one present interior
+/// link (which `node_on_path(.., level)` being `Some` guarantees), and `links_wf`
+/// keeps every on-path node live so `walk_from` never bails early.
+pub proof fn lemma_walk_follows_path<V: PtPage>(t: PageTablePerms<V>, vpn: VPage, level: nat)
+    requires
+        t.contains(t.root()),
+        t.links_wf(),
+        level <= ROOT_LEVEL,
+        t.node_on_path(vpn, level) is Some,
+    ensures
+        t.walk(vpn) == t.walk_from(
+            t.node_on_path(vpn, level)->Some_0,
+            level,
+            vpn,
+            t.path_acc(vpn, level),
+        ),
+    decreases ROOT_LEVEL - level,
+{
+    if level >= ROOT_LEVEL {
+        // Base: node_on_path is the root, path_acc is the identity - definitional.
+    } else {
+        // The level just above is on the path too; recurse there.
+        assert(t.node_on_path(vpn, level + 1) is Some);
+        lemma_walk_follows_path::<V>(t, vpn, level + 1);
+        let p = t.node_on_path(vpn, level + 1)->Some_0;
+        let pidx = pt_index(vpn, level + 1);
+        // node_on_path(level) Some => (p, pidx) is a present interior link to our node.
+        assert(t.interior_at(p, pidx));
+        assert(t.entry(p, pidx).target == t.node_on_path(vpn, level)->Some_0);
+        // So walk_from at p takes the interior branch into our node.
+        assert(t.contains(p));
+        assert(!t.entry(p, pidx).leaf && t.level(p) != 0);
+    }
+}
+
+/// The local bridge `map`/`unmap` use: at a node the path reaches, a leaf entry
+/// yields a concrete `walk` result whose leaf-direct fields (frame/size/enc) are
+/// determined by the entry. Couples a single leaf write to `walk(vpn)`.
+pub proof fn lemma_leaf_walk<V: PtPage>(t: PageTablePerms<V>, n: PFN, idx: nat, vpn: VPage)
+    requires
+        t.contains(t.root()),
+        t.links_wf(),
+        t.xlate_base_reflects_walk(),
+        t.contains(n),
+        t.node_covers(n, vpn),
+        idx == pt_index(vpn, t.level(n)),
+        t.leaf_at(n, idx),
+    ensures
+        t.walk(vpn) is Some,
+        t.walk(vpn)->Some_0.frame == (t.entry(n, idx).target + vpn % span(t.level(n))) as nat,
+        t.walk(vpn)->Some_0.size == size_of_level(t.level(n)),
+        t.walk(vpn)->Some_0.enc == t.entry(n, idx).enc,
+{
+    let l = t.level(n);
+    // reflects_walk: the path reaches exactly this node for vpn.
+    assert(t.node_on_path(vpn, l) == Some(n));
+    lemma_walk_follows_path::<V>(t, vpn, l);
+    // walk_from(n, l, vpn, acc) reads the leaf entry (present, leaf-or-level-0).
+    assert(t.entry(n, pt_index(vpn, l)).present);
 }
 
 // =====================================================================
@@ -782,6 +984,11 @@ pub fn alloc_child<V: PtPage>(
                 idx as nat,
                 interior_entry(child_pfn as nat),
             )
+            &&& final(perms).xlate_base(child_pfn as nat) == old(perms).entry_vpn_base(
+                parent,
+                idx as nat,
+            )
+            &&& final(perms).va_map() == old(perms).va_map()
         },
         r matches Err(_) ==> *final(perms) == *old(perms),
 {
@@ -800,6 +1007,11 @@ pub fn alloc_child<V: PtPage>(
     let Tracked(child_perm) = child_perm_t;
     proof {
         perms.pages_.tracked_insert(child_pfn as nat, child_perm);
+        // The child translates the sub-range of `parent[idx]` (structural base).
+        perms.xlate_base_ = perms.xlate_base_.insert(
+            child_pfn as nat,
+            t0.entry_vpn_base(parent, idx as nat),
+        );
     }
     let pte = V::make_interior(child_pfn);
     let tracked parent_perm = perms.pages_.tracked_borrow_mut(parent);
@@ -862,7 +1074,12 @@ pub proof fn lemma_singleton_table<V: PtPage>(rp: PFN, tracked root_perm: PTNode
     let va = root_perm.va();
     let tracked mut m = Map::<PFN, PTNodePerm<V>>::tracked_empty();
     m.tracked_insert(rp, root_perm);
-    let tracked perms = PageTablePerms { root_: rp, pages_: m, frames_: Set::empty() };
+    let tracked perms = PageTablePerms {
+        root_: rp,
+        pages_: m,
+        xlate_base_: Map::empty().insert(rp, 0),
+        va_map_: Map::empty(),
+    };
 
     assert(perms.contains(rp));
     assert(perms.node_va(rp) == va);
@@ -1264,6 +1481,7 @@ pub fn free_child<V: PtPage>(
         final(perms).root() == old(perms).root(),
         !final(perms).contains(child),
         final(perms).node(parent) == old(perms).node(parent).update(idx as nat, entry_absent()),
+        final(perms).va_map() == old(perms).va_map(),
 {
     let ghost t0 = *perms;
     // 1. clear the parent's interior slot.
@@ -1274,6 +1492,7 @@ pub fn free_child<V: PtPage>(
     let tracked child_perm;
     proof {
         child_perm = perms.pages_.tracked_remove(child);
+        perms.xlate_base_ = perms.xlate_base_.remove(child);
     }
     node_free::<V>(child_va, Tracked(child_perm));
     // 3. re-establish the invariant.
@@ -1356,6 +1575,13 @@ pub open spec fn region_of(vpn: VPage) -> RegionKind {
     } else {
         RegionKind::Unused
     }
+}
+
+/// A vpn whose translation is a user data mapping (recorded in `va_map_`) rather
+/// than the recursive self-map subtree (which resolves page-table pages, not data,
+/// and is governed by `tree_inv`). Soundness clause (B) is scoped to this region.
+pub open spec fn in_user_region(vpn: VPage) -> bool {
+    region_of(vpn) != RegionKind::SelfMap
 }
 
 /// The attribute policy each region's translations must satisfy.
