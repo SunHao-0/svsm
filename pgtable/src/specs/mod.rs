@@ -16,6 +16,8 @@
 //!               permission set.
 //!
 //! Compiled only under verification (`verus_only`).
+#![allow(missing_debug_implementations)]
+
 pub mod node;
 pub mod perm;
 pub mod table;

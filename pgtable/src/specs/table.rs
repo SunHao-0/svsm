@@ -18,11 +18,12 @@
 // in a later layer.
 //
 // Compiled only under verification (`verus_only`).
-
 use crate::specs::node::{
-    ENTRIES, Entry, PFN, PTNode, PTNodePerm, PageSz, PtPage, ROOT_LEVEL, VPage, pt_index,
-    size_of_level, span,
+    ENTRIES, Entry, PFN, PTNode, PTNodePerm, PageSz, PtPage, ROOT_LEVEL, VPage, lemma_node_struct_wf,
+    node_alloc, node_free, node_read_entry, node_set_entry, pt_index, size_of_level, span,
 };
+use crate::specs::perm::{PA, VA};
+use crate::stubs::SvsmError;
 use vstd::prelude::*;
 
 verus! {
@@ -30,7 +31,6 @@ verus! {
 // =====================================================================
 // Top-level (PML4) index partition of the address space
 // =====================================================================
-
 pub spec const IDX_PERTASK: nat = 508;
 
 pub spec const IDX_SELFMAP: nat = 493;
@@ -42,7 +42,6 @@ pub spec const IDX_SHARED: nat = 511;
 // =====================================================================
 // Walk result and the (compile-time) architecture permission algebra
 // =====================================================================
-
 /// Effective access permission produced by a walk.
 #[derive(PartialEq, Eq, Structural, Debug)]
 pub struct Perm {
@@ -53,7 +52,6 @@ pub struct Perm {
 }
 
 /// The result of translating a page.
-#[allow(missing_debug_implementations)]
 pub struct Walk {
     pub frame: PFN,
     pub size: PageSz,
@@ -108,13 +106,11 @@ pub open spec fn leaf_only_perm(e: Entry) -> Perm {
 // =====================================================================
 // The page table: a permission collection + its mapped-frame footprint
 // =====================================================================
-
 /// All page-table-node permissions of one page table, keyed by physical frame,
 /// the root frame (CR3), and the set of data frames the leaves map (`frames_`).
 /// Owning the permissions - not just a view - is what makes this the page table
 /// rather than a snapshot of it; `frames_` is the analogue for the data pages it
 /// refers to.
-#[allow(missing_debug_implementations)]
 pub tracked struct PageTablePerms<V: PtPage> {
     root_: PFN,
     pages_: Map<PFN, PTNodePerm<V>>,
@@ -157,14 +153,24 @@ impl<V: PtPage> PageTablePerms<V> {
         self.node(p).e[idx]
     }
 
-    // --- entry classification ----------------------------------------
+    /// The direct-map virtual address of node `p` - the access handle the exec
+    /// code uses to read/write the page. Exposed so operations can tie the `VA`
+    /// the caller passes (from a walk) to the node in the store.
+    pub open spec fn node_va(self, p: PFN) -> VA {
+        self.pages()[p].va()
+    }
 
-    /// `(n, idx)` is a present interior (child-pointing) entry of a live node.
+    // --- entry classification ----------------------------------------
+    /// `(n, idx)` is a present interior (child-pointing) entry of a live node. A
+    /// level-0 entry is never interior (its target is a 4K frame, not a child
+    /// table - x86 leaves the HUGE bit clear there), so `interior_at` and `leaf_at`
+    /// are complementary on present entries.
     pub open spec fn interior_at(self, n: PFN, idx: nat) -> bool {
         &&& self.contains(n)
         &&& idx < ENTRIES
         &&& self.node(n).e.dom().contains(idx)
         &&& self.entry(n, idx).present
+        &&& self.level(n) != 0
         &&& !self.entry(n, idx).leaf
     }
 
@@ -178,8 +184,28 @@ impl<V: PtPage> PageTablePerms<V> {
         &&& (self.level(n) == 0 || self.entry(n, idx).leaf)
     }
 
-    // --- mapped-frame footprint --------------------------------------
+    /// The (focused, mostly local) precondition under which writing entry `idx` of
+    /// node `pfn` to `e` preserves `tree_inv` - the obligation `table_set_entry`
+    /// asks of the caller. It covers the common map/unmap-DATA case:
+    ///   * the slot is currently NOT an interior link (so the tree shape - which is
+    ///     entirely about interior links - cannot change);
+    ///   * the new entry is itself NOT an interior link, and if present is a valid
+    ///     leaf (aligned to its level, level <= 2);
+    ///   * the new entry is A/D-pinned.
+    /// Building/tearing-down interior links is the job of `alloc_child`/`free_child`.
+    pub open spec fn valid_leaf_write(self, pfn: PFN, idx: nat, e: Entry) -> bool {
+        &&& self.contains(pfn)
+        &&& idx < ENTRIES
+        &&& !self.interior_at(pfn, idx)
+        &&& entry_pinned(e)
+        &&& (e.present ==> {
+            &&& (self.level(pfn) == 0 || e.leaf)
+            &&& self.level(pfn) <= 2
+            &&& e.target % span(self.level(pfn)) == 0
+        })
+    }
 
+    // --- mapped-frame footprint --------------------------------------
     /// The 4K data frames mapped by leaf `(n, idx)`: one frame for a 4K leaf, 512
     /// for a 2M leaf, 512*512 for a 1G leaf. Empty if `(n, idx)` is not a leaf.
     pub open spec fn entry_frames(self, n: PFN, idx: nat) -> Set<PFN> {
@@ -202,7 +228,6 @@ impl<V: PtPage> PageTablePerms<V> {
     }
 
     // --- the MMU walk, over the permission set -----------------------
-
     /// The MMU walk from `node` at `level` for page `vpn`, accumulating permission.
     /// Bounded by `level`, so it terminates even though the self-map makes the
     /// graph cyclic. Architecture is fixed by `ARCH`.
@@ -240,7 +265,6 @@ impl<V: PtPage> PageTablePerms<V> {
     }
 
     // --- structural well-formedness ----------------------------------
-
     /// The recursive self-map slot: the root's entry that points back to the root.
     pub open spec fn is_self_map(self, n: PFN, idx: nat) -> bool {
         self.level(n) == ROOT_LEVEL && idx == IDX_SELFMAP
@@ -249,7 +273,8 @@ impl<V: PtPage> PageTablePerms<V> {
     /// Node `n`'s present entries resolve correctly: leaves are aligned to their
     /// level, interior links resolve one level down (self-map aside).
     pub open spec fn node_wf(self, n: PFN) -> bool {
-        forall|idx: nat| #![trigger self.entry(n, idx)]
+        forall|idx: nat|
+            #![trigger self.entry(n, idx)]
             (idx < ENTRIES && self.node(n).e.dom().contains(idx) && self.entry(n, idx).present)
                 ==> {
                 let e = self.entry(n, idx);
@@ -267,11 +292,11 @@ impl<V: PtPage> PageTablePerms<V> {
             }
     }
 
-    /// Every live node has its full 512 entries and obeys `node_wf`.
-    pub open spec fn nodes_wf(self) -> bool {
-        forall|n: PFN| #[trigger]
-            self.contains(n) ==> (forall|i: nat| self.node(n).e.dom().contains(i) <==> i < ENTRIES)
-                && self.node_wf(n)
+    /// Every link of every live node resolves (the content-dependent half of
+    /// `node_wf`; the structural full-512-entry half is in `store_wf` via each
+    /// node permission's own `wf()`).
+    pub open spec fn links_wf(self) -> bool {
+        forall|n: PFN| #[trigger] self.contains(n) ==> self.node_wf(n)
     }
 
     /// The table is a valid TREE with a single self-reference (the self-map):
@@ -292,57 +317,269 @@ impl<V: PtPage> PageTablePerms<V> {
             #![trigger self.interior_at(n1, i1), self.interior_at(n2, i2)]
             (self.interior_at(n1, i1) && self.interior_at(n2, i2) && self.entry(n1, i1).target
                 == self.entry(n2, i2).target) ==> (n1 == n2 && i1 == i2)
-        &&& forall|c: PFN| #![trigger self.contains(c)]
-            self.contains(c) ==> exists|n: PFN, idx: nat| #![trigger self.interior_at(n, idx)]
+        &&& forall|c: PFN|
+            #![trigger self.contains(c)]
+            self.contains(c) ==> exists|n: PFN, idx: nat|
+                #![trigger self.interior_at(n, idx)]
                 self.interior_at(n, idx) && self.entry(n, idx).target == c
     }
 
-    /// The root-owned page-table invariant: the root is a live top-level node,
-    /// every permission is well-formed and keyed by its own PFN, every node is
-    /// structurally well-formed, the table is a valid tree with the single
-    /// self-map, the whole table is A/D-pinned, and the tracked mapped-frame set
-    /// is exactly the frames the leaves refer to.
-    pub open spec fn wf(self) -> bool {
+    /// The STRUCTURAL store invariant: every live entry is a well-formed node
+    /// permission keyed by its own PFN. This half is *free* - preserved by any
+    /// node-content edit and by insert/remove - so the table behaves like a plain
+    /// `PtPage` store for editing (cf. `PTNodePerm::wf`, which is also structural).
+    pub open spec fn store_wf(self) -> bool {
+        forall|p: PFN| #[trigger]
+            self.contains(p) ==> {
+                &&& self.pages()[p].wf()
+                &&& self.pages()[p].pfn() == p
+            }
+    }
+
+    /// The EARNED page-table invariant: the store represents a valid tree. This
+    /// half is content-dependent (links resolve, the tree shape with its single
+    /// self-map, A/D-pinning) and is maintained by the modification operations; it
+    /// is the hypothesis `walk`/`region_typed`/`confidential` rely on.
+    ///
+    /// (Frame tracking - `frames() == mapped_frames()` - is intentionally NOT part
+    /// of this yet; it is left simple and will be reworked later.)
+    pub open spec fn tree_inv(self) -> bool {
         &&& self.contains(self.root())
         &&& self.level(self.root()) == ROOT_LEVEL
-        &&& forall|p: PFN| #[trigger] self.contains(p) ==> {
-            &&& self.pages()[p].wf()
-            &&& self.pages()[p].pfn() == p
-        }
-        &&& self.nodes_wf()
+        &&& self.links_wf()
         &&& self.tree_wf()
         &&& self.ad_pinned()
-        &&& self.frames() == self.mapped_frames()
+    }
+
+    /// The full root-owned page-table invariant: the free structural store part
+    /// plus the earned valid-tree part.
+    pub open spec fn wf(self) -> bool {
+        &&& self.store_wf()
+        &&& self.tree_inv()
     }
 
     // --- region typing -----------------------------------------------
-
     /// Every translation respects its region's policy.
     pub open spec fn region_typed(self) -> bool {
-        forall|vpn: VPage| #![trigger self.walk(vpn)]
+        forall|vpn: VPage|
+            #![trigger self.walk(vpn)]
             self.walk(vpn) is Some ==> region_walk_ok(region_of(vpn), self.walk(vpn)->Some_0)
     }
 
     // --- the A/D ownership discipline --------------------------------
-
     /// Every entry of every live node is A/D-pinned, so the MMU's only concurrent
     /// write (raising ACCESSED) is a no-op (see `lemma_entry_pin_accessed_noop`).
     pub open spec fn ad_pinned(self) -> bool {
-        forall|n: PFN, i: nat| #![trigger self.entry(n, i)]
-            (self.contains(n) && i < ENTRIES && self.node(n).e.dom().contains(i))
-                ==> entry_pinned(self.entry(n, i))
+        forall|n: PFN, i: nat|
+            #![trigger self.entry(n, i)]
+            (self.contains(n) && i < ENTRIES && self.node(n).e.dom().contains(i)) ==> entry_pinned(
+                self.entry(n, i),
+            )
     }
 
     // --- confidentiality ---------------------------------------------
-
     /// Every translation reads a page as host-shared (`enc == false`) iff its
     /// frames are in the software's `host_shared` set.
     pub open spec fn confidential(self, host_shared: Set<PFN>) -> bool {
-        forall|vpn: VPage| #![trigger self.walk(vpn)]
+        forall|vpn: VPage|
+            #![trigger self.walk(vpn)]
             self.walk(vpn) is Some ==> {
                 let w = self.walk(vpn)->Some_0;
                 (!w.enc) <==> walk_frames(w).subset_of(host_shared)
             }
+    }
+}
+
+// =====================================================================
+// Table operations: edit the store, the invariant is maintained
+// =====================================================================
+//
+// The table is a `PtPage` store: an operation borrows a node out of the store,
+// drives it with the existing `node_*` ops (which the user can think of as
+// "operating on a page"), and the framework re-establishes the table invariant.
+// Reads/leaf-writes only need `store_wf` to be touched; the earned `tree_inv` is
+// re-derived by the per-op preservation argument.
+
+/// Read entry `idx` of node `pfn` through the store. `node_va` is the access
+/// handle the caller holds for that node (e.g. obtained from a walk).
+pub fn table_read_entry<V: PtPage>(
+    node_va: VA,
+    Ghost(pfn): Ghost<PFN>,
+    idx: usize,
+    Tracked(perms): Tracked<&PageTablePerms<V>>,
+) -> (pte: V::Pte)
+    requires
+        perms.store_wf(),
+        perms.contains(pfn),
+        node_va == perms.node_va(pfn),
+        idx < 512,
+    ensures
+        V::decode(pte) == perms.entry(pfn, idx as nat),
+{
+    let tracked node_perm = perms.pages_.tracked_borrow(pfn);
+    node_read_entry::<V>(node_va, Tracked(node_perm), idx)
+}
+
+/// The framework's whole preservation argument for a leaf write: if `t1` is `t0`
+/// with node `pfn`'s entry `idx` set to a leaf/absent `e` that satisfies
+/// `valid_leaf_write` - and nothing else changed - then `t1` is still a valid
+/// tree. Because a leaf write never touches an interior link, `interior_at` (and
+/// hence the entire tree shape) is unchanged, so every `tree_wf` clause transfers
+/// verbatim. The caller of `table_set_entry` never sees this.
+#[verifier::rlimit(40)]
+pub proof fn lemma_leaf_write_preserves_tree_inv<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    pfn: PFN,
+    idx: nat,
+    e: Entry,
+)
+    requires
+        t0.store_wf(),
+        t0.tree_inv(),
+        t0.valid_leaf_write(pfn, idx, e),
+        t1.root() == t0.root(),
+        t1.pages().dom() == t0.pages().dom(),
+        t1.node(pfn) == t0.node(pfn).update(idx, e),
+        forall|m: PFN| m != pfn ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| #[trigger] t1.level(m) == t0.level(m),
+    ensures
+        t1.tree_inv(),
+{
+    broadcast use lemma_node_struct_wf;
+
+    let r = t0.root();
+    // node(pfn) has its full entry set, so inserting at idx (already present)
+    // leaves its domain - and hence `contains` and node domains - unchanged.
+    assert(t0.node(pfn).e.dom().contains(idx));
+    assert forall|n: PFN| t1.contains(n) implies #[trigger] t1.node(n).e.dom() =~= t0.node(n).e.dom()
+        by {
+        if n == pfn {
+            assert(t0.node(pfn).e.insert(idx, e).dom() =~= t0.node(pfn).e.dom());
+        }
+    }
+    // Entries agree everywhere except (pfn, idx); at (pfn, idx) it is a leaf/absent.
+    assert forall|n: PFN, i: nat| (n != pfn || i != idx) implies #[trigger] t1.entry(n, i)
+        == t0.entry(n, i) by {
+        if n == pfn {
+            assert(t1.node(pfn).e[i] == t0.node(pfn).e.insert(idx, e)[i]);
+        }
+    }
+    // Therefore interior_at is unchanged everywhere - the heart of the argument.
+    assert forall|n: PFN, i: nat| #[trigger] t1.interior_at(n, i) == t0.interior_at(n, i) by {
+        if !(n == pfn && i == idx) {
+            assert(t1.entry(n, i) == t0.entry(n, i));
+        }
+    }
+    assert(!t1.interior_at(pfn, idx));
+    assert(t0.interior_at(r, IDX_SELFMAP));
+    assert(!t0.interior_at(pfn, idx));
+    // An interior entry of t1 is not the edited slot, so its entry is unchanged.
+    assert forall|n: PFN, i: nat| t1.interior_at(n, i) implies #[trigger] t1.entry(n, i) == t0.entry(
+        n,
+        i,
+    ) by {
+        if n == pfn && i == idx {
+        } else {
+            assert(t1.entry(n, i) == t0.entry(n, i));
+        }
+    }
+
+    // --- tree_wf, clause by clause -----------------------------------
+    // root is still the unique top-level node (levels/contains/root fixed).
+    assert forall|n: PFN| #![trigger t1.contains(n)]
+        t1.contains(n) && t1.level(n) == ROOT_LEVEL implies n == r by {
+        assert(t0.contains(n));
+    }
+    // the self-map is unchanged (it is interior in t0, hence not the edited slot).
+    assert(t1.interior_at(r, IDX_SELFMAP));
+    assert(t1.entry(r, IDX_SELFMAP) == t0.entry(r, IDX_SELFMAP));
+    // injectivity: an interior entry of t1 is one of t0 with the same target.
+    assert forall|n1: PFN, i1: nat, n2: PFN, i2: nat|
+        (#[trigger] t1.interior_at(n1, i1) && #[trigger] t1.interior_at(n2, i2) && t1.entry(
+            n1,
+            i1,
+        ).target == t1.entry(n2, i2).target) implies (n1 == n2 && i1 == i2) by {
+        assert(t0.interior_at(n1, i1));
+        assert(t0.interior_at(n2, i2));
+    }
+    // connectivity: t0's parent of c is still a parent in t1.
+    assert forall|c: PFN| #![trigger t1.contains(c)]
+        t1.contains(c) implies exists|n: PFN, i: nat|
+        #[trigger] t1.interior_at(n, i) && t1.entry(n, i).target == c by {
+        assert(t0.contains(c));
+        let w = choose|n: PFN, i: nat| t0.interior_at(n, i) && t0.entry(n, i).target == c;
+        assert(t1.interior_at(w.0, w.1));
+    }
+    assert(t1.tree_wf());
+
+    // links resolve: away from pfn unchanged; at pfn the edited slot is a valid leaf.
+    assert forall|n: PFN| t1.contains(n) implies #[trigger] t1.node_wf(n) by {
+        if n != pfn {
+            assert(t0.node_wf(n));
+        } else {
+            assert(t0.node_wf(pfn));
+        }
+    }
+    // A/D pinned: away from (pfn, idx) unchanged; at (pfn, idx) `e` is pinned.
+    assert forall|n: PFN, i: nat|
+        (t1.contains(n) && i < ENTRIES && t1.node(n).e.dom().contains(i)) implies entry_pinned(
+            #[trigger] t1.entry(n, i),
+        ) by {
+        if !(n == pfn && i == idx) {
+            assert(t1.entry(n, i) == t0.entry(n, i));
+        }
+    }
+}
+
+/// Write entry `idx` of node `pfn` to `pte` (a leaf/absent value), maintaining the
+/// table invariant. Feels like editing a page in the store: it borrows the node,
+/// drives it with `node_set_entry`, then re-establishes `tree_inv` via the
+/// framework lemma. The caller's only obligation is the local `valid_leaf_write`.
+pub fn table_set_entry<V: PtPage>(
+    node_va: VA,
+    Ghost(pfn): Ghost<PFN>,
+    idx: usize,
+    pte: V::Pte,
+    Tracked(perms): Tracked<&mut PageTablePerms<V>>,
+)
+    requires
+        old(perms).wf(),
+        node_va == old(perms).node_va(pfn),
+        idx < 512,
+        old(perms).valid_leaf_write(pfn, idx as nat, V::decode(pte)),
+    ensures
+        final(perms).wf(),
+        final(perms).root() == old(perms).root(),
+        final(perms).node(pfn) == old(perms).node(pfn).update(idx as nat, V::decode(pte)),
+        forall|m: PFN| m != pfn ==> #[trigger] final(perms).node(m) == old(perms).node(m),
+{
+    let ghost t0 = *perms;
+    let ghost e = V::decode(pte);
+    let tracked node_perm = perms.pages_.tracked_borrow_mut(pfn);
+    node_set_entry::<V>(node_va, Tracked(node_perm), idx, pte);
+    proof {
+        broadcast use lemma_node_struct_wf;
+
+        let t1 = *perms;
+        // After the borrow, the store is t0 with pfn's node replaced (everything
+        // else identical) - spell that out for the lemma and the postconditions.
+        assert(t1.pages().dom() =~= t0.pages().dom());
+        assert(t1.pages()[pfn].wf());
+        assert(t1.pages()[pfn].pfn() == pfn);
+        assert(t1.node(pfn) == t0.node(pfn).update(idx as nat, e));
+        assert forall|m: PFN| m != pfn implies #[trigger] t1.node(m) == t0.node(m) by {}
+        assert forall|m: PFN| #[trigger] t1.level(m) == t0.level(m) by {}
+        // store_wf survives: pfn's permission stays well-formed and PFN-keyed
+        // (node_set_entry keeps its pa, hence pfn), the rest is untouched.
+        assert forall|p: PFN| t1.contains(p) implies (#[trigger] t1.pages()[p].wf()
+            && t1.pages()[p].pfn() == p) by {
+            assert(t0.contains(p));
+            if p != pfn {
+                assert(t1.pages()[p] == t0.pages()[p]);
+            }
+        }
+        lemma_leaf_write_preserves_tree_inv::<V>(t0, t1, pfn, idx as nat, e);
     }
 }
 
@@ -354,7 +591,6 @@ impl<V: PtPage> PageTablePerms<V> {
 // such permissive interiors do not restrict, so the combined walk permission is
 // decided by the leaf alone. The two algebraic facts below are the heart of that
 // argument; both are independent of any particular table.
-
 pub open spec fn permissive(e: Entry) -> bool {
     e.present && e.w && e.user && !e.nx
 }
@@ -378,7 +614,6 @@ pub proof fn lemma_top_combine_is_leaf_only(e: Entry)
 // =====================================================================
 // Region typing policy
 // =====================================================================
-
 #[derive(PartialEq, Eq, Structural, Debug)]
 pub enum RegionKind {
     User,
@@ -422,7 +657,6 @@ pub open spec fn region_walk_ok(kind: RegionKind, w: Walk) -> bool {
 // =====================================================================
 // A/D-pin discipline and confidentiality helpers
 // =====================================================================
-
 /// A present entry has ACCESSED set, and a writable one has DIRTY set.
 pub open spec fn entry_pinned(e: Entry) -> bool {
     e.present ==> (e.accessed && (e.w ==> e.dirty))

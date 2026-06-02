@@ -40,7 +40,6 @@ use crate::stubs::{SvsmError, alloc_zeroed_page, free_page, phys_to_virt, virt_t
 use core::marker::PhantomData;
 use vstd::prelude::*;
 use vstd::raw_ptr::MemContents;
-
 verus! {
 
 /// Declare the trusted `SvsmError` (defined outside `verus!`, in `stubs`) as an
@@ -48,27 +47,29 @@ verus! {
 /// `Result` returns).
 #[verifier::external_type_specification]
 #[verifier::external_body]
-#[allow(missing_debug_implementations)]
 pub struct ExSvsmError(SvsmError);
+
+/// The value of an all-zero `V` - i.e. `<V as zerocopy::FromZeros>::new_zeroed()`.
+///
+/// This is THE zero value, the single source of truth shared by allocation and
+/// the spec. A page is allocated zeroed (never by moving a page-sized value in),
+/// and a freshly allocated page holds exactly `zeroed::<V>()` (see
+/// `page_alloc_zeroed`). It is `uninterp` rather than a hand-written value on
+/// purpose: it *names* `FromZeros::new_zeroed()` for spec reasoning, so there is
+/// no second, independent definition that could disagree with the bytes the
+/// allocator actually writes.
+///
+/// Why not just use `FromZeros` directly: `FromZeros` cannot be a Verus bound
+/// (declaring it drags zerocopy's `impl FromZeros for AtomicU16/...` into Verus,
+/// which rejects the atomics) and `new_zeroed()` is an *exec* method, unusable in
+/// `spec`. So `FromZeros` lives only in the trusted allocator (plain Rust), and
+/// `zeroed` is its in-spec image. A concrete page type ties the two with one
+/// trusted per-type fact, e.g. `assume_specification[PTPage::new_zeroed]() ensures
+/// r == zeroed::<PTPage>()` - no generic `FromZeros` bound, no atomics.
+pub uninterp spec fn zeroed<V>() -> V;
 
 /// Bytes per 4K page (spec-level arithmetic uses `nat`).
 pub spec const PAGE_SIZE: nat = 4096;
-
-/// Types whose all-zero bit pattern is a valid value. `zeroed()` is the spec
-/// value a freshly zeroed page of this type holds. A page is never allocated by
-/// moving a (page-sized) value in; it is allocated zeroed, and this trait names
-/// the resulting value. When this crate moves into the kernel, the implementors
-/// are exactly the `zerocopy::FromZeros` page-content types.
-pub trait ZeroInit: Sized {
-    spec fn zeroed() -> Self;
-}
-
-// A small concrete implementor so the verified `perm_demo` below can allocate.
-impl ZeroInit for u64 {
-    open spec fn zeroed() -> u64 {
-        0
-    }
-}
 
 // =====================================================================
 // Addresses: authority-free, Copy handles
@@ -78,41 +79,10 @@ impl ZeroInit for u64 {
 // with a matching tracked permission. The fields are public so the solver knows
 // that equal addresses are equal `VA`/`PA` values.
 /// A physical address. The page identity (`pfn`) is derived from it.
-#[allow(missing_debug_implementations)]
+#[derive(Clone, Copy, Debug)]
 pub struct PA(pub usize);
 
-/// A virtual address. For a page permission this is the *direct-map* virtual
-/// address through which the page is accessed.
-#[allow(missing_debug_implementations)]
-pub struct VA(pub usize);
-
-impl Clone for PA {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl Copy for PA {
-
-}
-
-impl Clone for VA {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl Copy for VA {
-
-}
-
 impl PA {
-    pub open spec fn addr(self) -> usize {
-        self.0
-    }
-}
-
-impl VA {
     pub open spec fn addr(self) -> usize {
         self.0
     }
@@ -128,6 +98,17 @@ pub open spec fn pa_page_aligned(pa: PA) -> bool {
     (pa.addr() as nat) % PAGE_SIZE == 0
 }
 
+/// A virtual address. For a page permission this is the *direct-map* virtual
+/// address through which the page is accessed.
+#[derive(Clone, Copy, Debug)]
+pub struct VA(pub usize);
+
+impl VA {
+    pub open spec fn addr(self) -> usize {
+        self.0
+    }
+}
+
 /// Trusted direct-map relation: the virtual address the kernel accesses a
 /// physical page through. Both directions are functions; a `PagePerm`'s `wf()`
 /// pins them together. This intentionally talks about raw integers — neither
@@ -135,18 +116,6 @@ pub open spec fn pa_page_aligned(pa: PA) -> bool {
 pub uninterp spec fn direct_map(pa: PA) -> VA;
 
 pub uninterp spec fn reverse_direct_map(va: VA) -> PA;
-
-/// Compute the direct-map virtual address of a physical address. Trusted: wraps
-/// the platform `phys_to_virt`, and is the only executable bridge from a `PA` to
-/// its `VA`.
-#[verifier::external_body]
-pub fn va_of(pa: PA) -> (r: VA)
-    ensures
-        r == direct_map(pa),
-        reverse_direct_map(r) == pa,
-{
-    VA(phys_to_virt(PhysAddr::from(pa.0)).bits())
-}
 
 // =====================================================================
 // Layer 0: FramePerm - physical-frame region (contents not tracked)
@@ -158,7 +127,6 @@ pub fn va_of(pa: PA) -> (r: VA)
 // as a future trusted entry point.
 /// Ownership of a set of physical 4K frames, without tracking their contents.
 #[verifier::external_body]
-#[allow(missing_debug_implementations)]
 pub tracked struct FramePerm {}
 
 impl FramePerm {
@@ -207,7 +175,6 @@ impl FramePerm {
 // =====================================================================
 /// The ghost contents of a `PagePerm<V>`: the access address, the physical frame,
 /// and the (possibly uninitialized) value.
-#[allow(missing_debug_implementations)]
 pub ghost struct PagePermData<V> {
     pub va: VA,
     pub pa: PA,
@@ -217,7 +184,6 @@ pub ghost struct PagePermData<V> {
 /// The unique authority to access one 4K page that holds a `V`.
 #[verifier::external_body]
 #[verifier::accept_recursive_types(V)]
-#[allow(missing_debug_implementations)]
 pub tracked struct PagePerm<V> {
     phantom: PhantomData<V>,
 }
@@ -368,18 +334,23 @@ pub fn page_take<V>(va: VA, Tracked(perm): Tracked<&mut PagePerm<V>>) -> (v: V)
 
 // --- trusted allocate / free, via the shared stub page allocator ---
 /// Allocate one zeroed 4K page from the (stub) page allocator and return its
-/// access addresses plus the owning permission. The page is born zero-initialized
-/// (`V::zeroed()`); no page-sized value is moved in. No dealloc token is minted:
-/// the returned `PagePerm` *is* the right to later free the page. This rests on
-/// the same `stubs::alloc_zeroed_page` the page-table source uses.
+/// access addresses plus the owning permission. The page is born holding exactly
+/// `zeroed::<V>()` - the all-zero value the allocator writes, i.e. `V`'s
+/// `FromZeros` zero - so the spec value and the bytes can never disagree. No
+/// page-sized value is moved in, and no dealloc token is minted: the returned
+/// `PagePerm` *is* the right to later free the page. This rests on the same
+/// `stubs::alloc_zeroed_page` the page-table source uses.
+///
+/// `V` is expected to be `FromZeros` (so an all-zero page is a valid `V`); that is
+/// a documented requirement, not a Verus bound (`FromZeros` cannot be one).
 #[verifier::external_body]
-pub fn page_alloc_zeroed<V: ZeroInit>() -> (r: Result<(VA, PA, Tracked<PagePerm<V>>), SvsmError>)
+pub fn page_alloc_zeroed<V>() -> (r: Result<(VA, PA, Tracked<PagePerm<V>>), SvsmError>)
     ensures
         r matches Ok((va, pa, perm)) ==> {
             &&& perm@.wf()
             &&& perm@.va() == va
             &&& perm@.pa() == pa
-            &&& perm@.opt_value() == MemContents::Init(V::zeroed())
+            &&& perm@.opt_value() == MemContents::Init(zeroed::<V>())
         },
 {
     let vaddr = match alloc_zeroed_page() {
@@ -413,14 +384,17 @@ pub fn page_free<V>(va: VA, Tracked(perm): Tracked<PagePerm<V>>)
 // discharged purely from the permission contracts. It is the proof that the
 // fundamental layer is usable and sound.
 pub fn perm_demo() {
-    let (va, _pa, mut perm) = match page_alloc_zeroed::<u64>() {
+    let (va, pa, mut perm) = match page_alloc_zeroed::<u64>() {
         Ok(t) => t,
         Err(_) => return,
     };
 
-    // A freshly allocated page is zero-initialized.
+    assert(direct_map(pa) == va);
+    assert(reverse_direct_map(va) == pa);
+
+    // A freshly allocated page holds the zero value (`zeroed::<u64>()`).
     let a = page_read::<u64>(va, Tracked(perm.borrow()));
-    assert(a == 0);
+    assert(a == zeroed::<u64>());
 
     // Overwrite and read back.
     page_write::<u64>(va, Tracked(perm.borrow_mut()), 9);

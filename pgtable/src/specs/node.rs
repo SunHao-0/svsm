@@ -24,7 +24,7 @@
 //
 // Compiled only under verification (`verus_only`).
 use crate::specs::perm::{
-    PA, PagePerm, VA, ZeroInit, page_alloc_zeroed, page_borrow, page_borrow_mut, page_free,
+    PA, PagePerm, VA, page_alloc_zeroed, page_borrow, page_borrow_mut, page_free, zeroed,
 };
 use crate::stubs::SvsmError;
 use vstd::prelude::*;
@@ -94,7 +94,6 @@ pub open spec fn pt_index(vpn: VPage, level: nat) -> nat {
 /// 8-byte word. STRUCTURAL bits (software-written): present, leaf, target, w,
 /// user, nx, global, enc. STATUS bits (co-owned with the MMU, monotone):
 /// accessed, dirty.
-#[allow(missing_debug_implementations)]
 pub struct Entry {
     pub present: bool,
     /// `true` = leaf (maps `target` as a frame); `false` = interior (child table).
@@ -112,7 +111,6 @@ pub struct Entry {
 }
 
 /// A node: 512 entries (indices `0..512`).
-#[allow(missing_debug_implementations)]
 pub struct PTNode {
     pub e: Map<nat, Entry>,
 }
@@ -143,7 +141,7 @@ impl PTNode {
 /// architectural `[PTEntry; 512]` page). It is the seam between the executable
 /// representation - which the author manipulates in place through a real
 /// `&mut Self` - and the abstract node the verifier reasons about.
-pub trait PtPage: ZeroInit + Sized {
+pub trait PtPage: Sized {
     /// The concrete entry type (e.g. the architectural `PTEntry`).
     type Pte: Copy;
 
@@ -166,10 +164,12 @@ pub trait PtPage: ZeroInit + Sized {
     ;
 
     /// A freshly zeroed page maps to the empty node (no present entries). This is
-    /// what lets `node_alloc` mint a well-formed, empty node.
+    /// what lets `node_alloc` mint a well-formed, empty node. `zeroed::<Self>()` is
+    /// the all-zero (`FromZeros`) value the allocator writes, so a concrete impl
+    /// discharges this from "decoding an all-zero entry yields not-present".
     proof fn zeroed_is_empty()
         ensures
-            Self::zeroed().view().empty(),
+            zeroed::<Self>().view().empty(),
     ;
 
     /// Read entry `i`. Specified against the abstract node.
@@ -202,13 +202,23 @@ pub proof fn lemma_all_views_wf<V: PtPage>()
     }
 }
 
+/// A node permission's mapped node is ALWAYS structurally well-formed (the full
+/// architectural entry set), for any page value - via `view_wf`. Broadcast so the
+/// table layer, which only sees the closed `PTNodePerm`, can still rely on
+/// `node().wf()` without unfolding `PTNodePerm::wf`.
+pub broadcast proof fn lemma_node_struct_wf<V: PtPage>(perm: PTNodePerm<V>)
+    ensures
+        (#[trigger] perm.node()).wf(),
+{
+    perm.perm.value().view_wf();
+}
+
 // =====================================================================
 // PTNodePerm<V>: the page-table-page permission
 // =====================================================================
 /// The unique authority over one live page-table node: a Layer-1 `PagePerm<V>`
 /// for the page, plus the ghost paging `level` the node sits at (needed by the
 /// tree invariants to prove parent/child levels decrease and huge leaves align).
-#[allow(missing_debug_implementations)]
 pub tracked struct PTNodePerm<V: PtPage> {
     perm: PagePerm<V>,
     level: nat,
@@ -278,7 +288,7 @@ pub fn node_alloc<V: PtPage>(level: usize) -> (r: Result<
     let Tracked(pp) = tpp;
     proof {
         V::zeroed_is_empty();
-        assert(pp.value() == V::zeroed());
+        assert(pp.value() == zeroed::<V>());
     }
     let tracked node = PTNodePerm { perm: pp, level: level as nat };
     Ok((va, pa, Tracked(node)))
@@ -355,6 +365,7 @@ pub fn node_set_entry<V: PtPage>(
         final(perm).wf(),
         final(perm).va() == old(perm).va(),
         final(perm).pa() == old(perm).pa(),
+        final(perm).pfn() == old(perm).pfn(),
         final(perm).level() == old(perm).level(),
         final(perm).node() == old(perm).node().update(i as nat, V::decode(pte)),
 {
