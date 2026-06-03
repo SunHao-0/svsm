@@ -1078,10 +1078,310 @@ pub proof fn lemma_leaf_write_preserves_tree_inv<V: PtPage>(
     }
 }
 
+/// A leaf write preserves the mapping BACKING too: a `valid_leaf_write` never makes
+/// an interior link, and leaves every node's base alone, so `interior_at` is
+/// pointwise unchanged and `xlate_wf` transfers verbatim. (`mapping_inv` is NOT
+/// preserved by a bare leaf write - `map`/`unmap` re-establish it after recording.)
+#[verifier::rlimit(40)]
+pub proof fn lemma_leaf_write_preserves_xlate_wf<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    pfn: PFN,
+    idx: nat,
+    e: Entry,
+)
+    requires
+        t0.store_wf(),
+        t0.xlate_wf(),
+        t0.valid_leaf_write(pfn, idx, e),
+        t1.root() == t0.root(),
+        t1.pages().dom() == t0.pages().dom(),
+        t1.node(pfn) == t0.node(pfn).update(idx, e),
+        forall|m: PFN| m != pfn ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| #[trigger] t1.level(m) == t0.level(m),
+        forall|m: PFN| #[trigger] t1.xlate_base(m) == t0.xlate_base(m),
+    ensures
+        t1.xlate_wf(),
+{
+    broadcast use lemma_node_struct_wf;
+
+    assert(t0.node(pfn).e.dom().contains(idx));
+    assert forall|n: PFN, i: nat| (n != pfn || i != idx) implies #[trigger] t1.entry(n, i)
+        == t0.entry(n, i) by {
+        if n == pfn {
+            assert(t1.node(pfn).e[i] == t0.node(pfn).e.insert(idx, e)[i]);
+        }
+    }
+    assert(!t0.interior_at(pfn, idx));  // valid_leaf_write
+    assert(!t1.interior_at(pfn, idx));  // e is a leaf/absent
+    assert forall|n: PFN, i: nat| #[trigger] t1.interior_at(n, i) == t0.interior_at(n, i) by {
+        if !(n == pfn && i == idx) {
+            assert(t1.entry(n, i) == t0.entry(n, i));
+        }
+    }
+    assert(t1.interiors_permissive()) by {
+        assert forall|n: PFN, i: nat| #[trigger] t1.interior_at(n, i) implies permissive(
+            t1.entry(n, i),
+        ) by {
+            assert(t0.interior_at(n, i));
+            assert(n != pfn || i != idx);
+            assert(t1.entry(n, i) == t0.entry(n, i));
+        }
+    }
+    assert(t1.xlate_base_consistent()) by {
+        assert(t1.xlate_base(t1.root()) == 0);
+        assert forall|p: PFN, i: nat| (#[trigger] t1.interior_at(p, i) && !t1.is_self_map(p, i))
+            implies t1.xlate_base(t1.entry(p, i).target) == t1.entry_vpn_base(p, i) by {
+            assert(t0.interior_at(p, i));
+            assert(p != pfn || i != idx);
+            assert(t1.entry(p, i) == t0.entry(p, i));
+            assert(!t0.is_self_map(p, i));
+            let tgt = t0.entry(p, i).target;
+            assert(t1.xlate_base(tgt) == t0.xlate_base(tgt));
+            assert(t1.entry_vpn_base(p, i) == t0.entry_vpn_base(p, i));
+        }
+    }
+    assert(t1.xlate_base_aligned()) by {
+        assert forall|n: PFN| #[trigger] t1.contains(n) implies t1.xlate_base(n) % span(
+            (t1.level(n) + 1) as nat,
+        ) == 0 by {
+            assert(t0.contains(n));
+        }
+    }
+}
+
+/// The framework proof behind `map`: writing a leaf into an ABSENT user-region slot
+/// `(node, idx)` and recording the single mapping `b = entry_vpn_base(node, idx)`
+/// preserves `mapping_inv`. The changed leaf IS the new mapping's, so every existing
+/// recorded witness keeps its (unchanged) leaf; the new leaf is recorded at `b`; and
+/// the caller's disjointness preconditions give the one-to-one clauses.
+#[verifier::rlimit(60)]
+pub proof fn lemma_map_records_mapping_inv<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    node: PFN,
+    idx: nat,
+    e: Entry,
+    b: VPage,
+)
+    requires
+        t0.store_wf(),
+        t0.mapping_inv(),
+        t0.xlate_base_aligned(),
+        t0.contains(node),
+        idx < ENTRIES,
+        t0.level(node) <= 2,
+        !t0.entry(node, idx).present,
+        e.present,
+        t0.level(node) == 0 || e.leaf,
+        e.target % span(t0.level(node)) == 0,
+        b == t0.entry_vpn_base(node, idx),
+        in_user_region(b),
+        t1.root() == t0.root(),
+        t1.pages().dom() == t0.pages().dom(),
+        t1.node(node) == t0.node(node).update(idx, e),
+        forall|m: PFN| m != node ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| #[trigger] t1.level(m) == t0.level(m),
+        forall|m: PFN| #[trigger] t1.xlate_base(m) == t0.xlate_base(m),
+        t1.va_map() == t0.va_map().insert(b, t1.vmap_of_leaf(node, idx)),
+        // the new mapping's vpn/frame ranges are disjoint from every existing one.
+        forall|b2: VPage| #[trigger]
+            t0.va_map().dom().contains(b2) ==> {
+                let s = t1.vmap_of_leaf(node, idx).size.pages();
+                let f = t1.vmap_of_leaf(node, idx).frame;
+                &&& (b + s <= b2 || b2 + t0.va_map()[b2].size.pages() <= b)
+                &&& (f + s <= t0.va_map()[b2].frame || t0.va_map()[b2].frame
+                    + t0.va_map()[b2].size.pages() <= f)
+            },
+    ensures
+        t1.mapping_inv(),
+{
+    broadcast use lemma_node_struct_wf;
+
+    let l = t0.level(node);
+    let m = t1.vmap_of_leaf(node, idx);
+    lemma_span_pos(l);
+    lemma_size_level_roundtrip(l);
+    assert(t0.node(node).e.dom().contains(idx));
+    assert forall|n: PFN, i: nat| (n != node || i != idx) implies #[trigger] t1.entry(n, i)
+        == t0.entry(n, i) by {
+        if n == node {
+            assert(t1.node(node).e[i] == t0.node(node).e.insert(idx, e)[i]);
+        }
+    }
+    assert(t1.entry(node, idx) == e);
+    assert(t1.leaf_at(node, idx));
+    assert forall|n: PFN, i: nat| (n != node || i != idx) implies #[trigger] t1.leaf_at(n, i)
+        == t0.leaf_at(n, i) by {
+        assert(t1.entry(n, i) == t0.entry(n, i));
+    }
+    // arithmetic for the new key b.
+    assert(t1.level(node) == l && m.size == size_of_level(l) && m.size.pages() == span(l));
+    assert(span((l + 1) as nat) == 512 * span(l));
+    assert(b == t0.xlate_base(node) + idx * span(l));
+    assert(t0.xlate_base(node) % span((l + 1) as nat) == 0);
+    lemma_base_aligned(t0.xlate_base(node), span(l), span((l + 1) as nat), idx);
+    assert(b % m.size.pages() == 0);
+    lemma_pt_index_in_entry(t0.xlate_base(node), span(l), span((l + 1) as nat), idx, b);
+    assert(pt_index(b, level_of_size(m.size)) == idx);
+    assert(t1.node_covers(node, b)) by {
+        assert((idx + 1) * span(l) <= 512 * span(l)) by (nonlinear_arith)
+            requires
+                idx < 512,
+                span(l) >= 0,
+        ;
+        assert(idx * span(l) + span(l) == (idx + 1) * span(l)) by (nonlinear_arith);
+    }
+    assert(t1.records_leaf(b, m, node, pt_index(b, level_of_size(m.size))));
+    assert(m.frame % m.size.pages() == 0);  // e.target % span(l) == 0
+    assert(t0.entry_vpn_base(node, idx) == t1.entry_vpn_base(node, idx));
+
+    // (Q): the new key records the new leaf; existing keys keep their (unchanged) leaf.
+    assert forall|b2: VPage| #[trigger] t1.va_map().dom().contains(b2) implies {
+        let m2 = t1.va_map()[b2];
+        &&& in_user_region(b2)
+        &&& b2 % m2.size.pages() == 0
+        &&& m2.frame % m2.size.pages() == 0
+        &&& exists|n: PFN| t1.records_leaf(b2, m2, n, pt_index(b2, level_of_size(m2.size)))
+    } by {
+        if b2 == b {
+            assert(t1.va_map()[b] == m);
+            assert(t1.records_leaf(b, m, node, pt_index(b, level_of_size(m.size))));
+        } else {
+            assert(t0.va_map().dom().contains(b2) && t1.va_map()[b2] == t0.va_map()[b2]);
+            let m2 = t0.va_map()[b2];
+            let ii = pt_index(b2, level_of_size(m2.size));
+            let w = choose|n: PFN| t0.records_leaf(b2, m2, n, ii);
+            assert(t0.records_leaf(b2, m2, w, ii));
+            assert(t0.entry_vpn_base(w, ii) == b2 && b2 != b);  // so (w,ii) != (node,idx)
+            assert(t1.records_leaf(b2, m2, w, ii));
+        }
+    }
+    // (P): the new leaf is recorded at b; existing leaves stay recorded.
+    assert forall|n: PFN, i: nat|
+        (#[trigger] t1.leaf_at(n, i) && in_user_region(t1.entry_vpn_base(n, i)))
+            implies t1.va_map().dom().contains(t1.entry_vpn_base(n, i)) by {
+        if !(n == node && i == idx) {
+            assert(t0.leaf_at(n, i));
+            assert(t1.entry_vpn_base(n, i) == t0.entry_vpn_base(n, i));
+        }
+    }
+    // (C) frame ranges disjoint, (D) vpn ranges disjoint.
+    assert forall|b1: VPage, b2: VPage|
+        (b1 != b2 && #[trigger] t1.va_map().dom().contains(b1) && #[trigger] t1.va_map().dom().contains(
+            b2,
+        )) implies {
+            &&& t1.va_map()[b1].frame + t1.va_map()[b1].size.pages() <= t1.va_map()[b2].frame
+                || t1.va_map()[b2].frame + t1.va_map()[b2].size.pages() <= t1.va_map()[b1].frame
+            &&& b1 + t1.va_map()[b1].size.pages() <= b2 || b2 + t1.va_map()[b2].size.pages() <= b1
+        } by {
+        if b1 != b && b2 != b {
+            assert(t1.va_map()[b1] == t0.va_map()[b1] && t1.va_map()[b2] == t0.va_map()[b2]);
+        } else if b1 == b {
+            assert(t0.va_map().dom().contains(b2) && t1.va_map()[b2] == t0.va_map()[b2]);
+            assert(t1.va_map()[b] == m);
+        } else {
+            assert(t0.va_map().dom().contains(b1) && t1.va_map()[b1] == t0.va_map()[b1]);
+            assert(t1.va_map()[b] == m);
+        }
+    }
+}
+
+/// The framework proof behind `unmap`: clearing the leaf at the recorded slot
+/// `(node, idx)` and dropping its mapping key `b = entry_vpn_base(node, idx)`
+/// preserves `mapping_inv`. The caller passes that `(node, idx)` is the UNIQUE leaf
+/// based at `b` (it is, by the tree shape) - so after clearing it no leaf is left
+/// unrecorded - and the surviving keys keep their (unchanged) leaves.
+#[verifier::rlimit(60)]
+pub proof fn lemma_unmap_clears_mapping_inv<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    node: PFN,
+    idx: nat,
+    b: VPage,
+)
+    requires
+        t0.store_wf(),
+        t0.mapping_inv(),
+        t0.contains(node),
+        idx < ENTRIES,
+        t0.level(node) <= 2,
+        t0.leaf_at(node, idx),
+        b == t0.entry_vpn_base(node, idx),
+        t0.va_map().dom().contains(b),
+        forall|n2: PFN, i2: nat|
+            (#[trigger] t0.leaf_at(n2, i2) && t0.entry_vpn_base(n2, i2) == b) ==> (n2 == node && i2
+                == idx),
+        t1.root() == t0.root(),
+        t1.pages().dom() == t0.pages().dom(),
+        t1.node(node) == t0.node(node).update(idx, entry_absent()),
+        forall|m: PFN| m != node ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| #[trigger] t1.level(m) == t0.level(m),
+        forall|m: PFN| #[trigger] t1.xlate_base(m) == t0.xlate_base(m),
+        t1.va_map() == t0.va_map().remove(b),
+    ensures
+        t1.mapping_inv(),
+{
+    broadcast use lemma_node_struct_wf;
+
+    assert(t0.node(node).e.dom().contains(idx));
+    assert forall|n: PFN, i: nat| (n != node || i != idx) implies #[trigger] t1.entry(n, i)
+        == t0.entry(n, i) by {
+        if n == node {
+            assert(t1.node(node).e[i] == t0.node(node).e.insert(idx, entry_absent())[i]);
+        }
+    }
+    assert(t1.entry(node, idx) == entry_absent());
+    assert(!t1.leaf_at(node, idx));
+    assert forall|n: PFN, i: nat| (n != node || i != idx) implies #[trigger] t1.leaf_at(n, i)
+        == t0.leaf_at(n, i) by {
+        assert(t1.entry(n, i) == t0.entry(n, i));
+    }
+    assert forall|n: PFN, i: nat| t0.leaf_at(n, i) implies #[trigger] t1.entry_vpn_base(n, i)
+        == t0.entry_vpn_base(n, i) by {}
+
+    // (Q): surviving keys (!= b) keep their unchanged leaf witness.
+    assert forall|b2: VPage| #[trigger] t1.va_map().dom().contains(b2) implies {
+        let m2 = t1.va_map()[b2];
+        &&& in_user_region(b2)
+        &&& b2 % m2.size.pages() == 0
+        &&& m2.frame % m2.size.pages() == 0
+        &&& exists|n: PFN| t1.records_leaf(b2, m2, n, pt_index(b2, level_of_size(m2.size)))
+    } by {
+        assert(b2 != b && t0.va_map().dom().contains(b2) && t1.va_map()[b2] == t0.va_map()[b2]);
+        let m2 = t0.va_map()[b2];
+        let ii = pt_index(b2, level_of_size(m2.size));
+        let w = choose|n: PFN| t0.records_leaf(b2, m2, n, ii);
+        assert(t0.records_leaf(b2, m2, w, ii));
+        assert(t0.entry_vpn_base(w, ii) == b2 && b2 != b);  // so (w,ii) != (node,idx)
+        assert(t1.records_leaf(b2, m2, w, ii));
+    }
+    // (P): surviving leaves are recorded; uniqueness => their base != b, so still kept.
+    assert forall|n: PFN, i: nat|
+        (#[trigger] t1.leaf_at(n, i) && in_user_region(t1.entry_vpn_base(n, i)))
+            implies t1.va_map().dom().contains(t1.entry_vpn_base(n, i)) by {
+        assert(t0.leaf_at(n, i));
+        assert(t0.entry_vpn_base(n, i) != b);  // uniqueness ((n,i) != (node,idx))
+    }
+    // (C)/(D): t1.va_map is a subset of t0.va_map, so disjointness is inherited.
+    assert forall|b1: VPage, b2: VPage|
+        (b1 != b2 && #[trigger] t1.va_map().dom().contains(b1) && #[trigger] t1.va_map().dom().contains(
+            b2,
+        )) implies {
+            &&& t1.va_map()[b1].frame + t1.va_map()[b1].size.pages() <= t1.va_map()[b2].frame
+                || t1.va_map()[b2].frame + t1.va_map()[b2].size.pages() <= t1.va_map()[b1].frame
+            &&& b1 + t1.va_map()[b1].size.pages() <= b2 || b2 + t1.va_map()[b2].size.pages() <= b1
+        } by {
+        assert(t0.va_map().dom().contains(b1) && t0.va_map().dom().contains(b2));
+        assert(t1.va_map()[b1] == t0.va_map()[b1] && t1.va_map()[b2] == t0.va_map()[b2]);
+    }
+}
+
 /// Write entry `idx` of node `pfn` to `pte` (a leaf/absent value), maintaining the
-/// table invariant. Feels like editing a page in the store: it borrows the node,
-/// drives it with `node_set_entry`, then re-establishes `tree_inv` via the
-/// framework lemma. The caller's only obligation is the local `valid_leaf_write`.
+/// table invariant AND the mapping backing (`xlate_wf`). Feels like editing a page
+/// in the store: it borrows the node, drives it with `node_set_entry`, then
+/// re-establishes the invariants. The caller's only obligation is `valid_leaf_write`.
+/// `mapping_inv` is the caller's (`map`/`unmap`) job, after recording the change.
 pub fn table_set_entry<V: PtPage>(
     node_va: VA,
     Ghost(pfn): Ghost<PFN>,
@@ -1091,14 +1391,20 @@ pub fn table_set_entry<V: PtPage>(
 )
     requires
         old(perms).wf(),
+        old(perms).xlate_wf(),
         node_va == old(perms).node_va(pfn),
         idx < 512,
         old(perms).valid_leaf_write(pfn, idx as nat, V::decode(pte)),
     ensures
         final(perms).wf(),
+        final(perms).xlate_wf(),
         final(perms).root() == old(perms).root(),
+        final(perms).pages().dom() == old(perms).pages().dom(),
         final(perms).node(pfn) == old(perms).node(pfn).update(idx as nat, V::decode(pte)),
         forall|m: PFN| m != pfn ==> #[trigger] final(perms).node(m) == old(perms).node(m),
+        forall|m: PFN| #[trigger] final(perms).level(m) == old(perms).level(m),
+        forall|m: PFN| #[trigger] final(perms).xlate_base(m) == old(perms).xlate_base(m),
+        final(perms).va_map() == old(perms).va_map(),
 {
     let ghost t0 = *perms;
     let ghost e = V::decode(pte);
@@ -1116,6 +1422,8 @@ pub fn table_set_entry<V: PtPage>(
         assert(t1.node(pfn) == t0.node(pfn).update(idx as nat, e));
         assert forall|m: PFN| m != pfn implies #[trigger] t1.node(m) == t0.node(m) by {}
         assert forall|m: PFN| #[trigger] t1.level(m) == t0.level(m) by {}
+        assert forall|m: PFN| #[trigger] t1.xlate_base(m) == t0.xlate_base(m) by {}
+        assert(t1.va_map() == t0.va_map());
         // store_wf survives: pfn's permission stays well-formed and PFN-keyed
         // (node_set_entry keeps its pa, hence pfn), the rest is untouched.
         assert forall|p: PFN| t1.contains(p) implies (#[trigger] t1.pages()[p].wf()
@@ -1126,6 +1434,7 @@ pub fn table_set_entry<V: PtPage>(
             }
         }
         lemma_leaf_write_preserves_tree_inv::<V>(t0, t1, pfn, idx as nat, e);
+        lemma_leaf_write_preserves_xlate_wf::<V>(t0, t1, pfn, idx as nat, e);
     }
 }
 
@@ -2515,6 +2824,242 @@ pub fn free_child<V: PtPage>(
             by {}
         assert(t1.va_map() == t0.va_map());
         lemma_unlink_child_preserves_mapping_wf::<V>(t0, t1, parent, idx as nat, child);
+    }
+}
+
+/// `wf` and `xlate_wf` read only `pages_`/`root_`/`xlate_base_`, never `va_map_`, so
+/// recording a mapping (a `va_map` change) preserves them. Proven once by congruence
+/// over the structural accessors, used by `map`/`unmap`.
+#[verifier::rlimit(40)]
+pub proof fn lemma_va_map_irrelevant<V: PtPage>(t: PageTablePerms<V>, t2: PageTablePerms<V>)
+    requires
+        t.store_wf(),
+        t.wf(),
+        t.xlate_wf(),
+        t2.pages() == t.pages(),
+        t2.root() == t.root(),
+        forall|n: PFN| #[trigger] t2.xlate_base(n) == t.xlate_base(n),
+    ensures
+        t2.wf(),
+        t2.xlate_wf(),
+{
+    broadcast use lemma_node_struct_wf;
+
+    assert forall|p: PFN| #[trigger] t2.contains(p) == t.contains(p) by {}
+    assert forall|p: PFN| #[trigger] t2.level(p) == t.level(p) by {}
+    assert forall|p: PFN| #[trigger] t2.node(p) == t.node(p) by {}
+    assert forall|n: PFN, i: nat| #[trigger] t2.entry(n, i) == t.entry(n, i) by {}
+    assert forall|n: PFN, i: nat| #[trigger] t2.interior_at(n, i) == t.interior_at(n, i) by {}
+    assert forall|n: PFN, i: nat| #[trigger] t2.is_self_map(n, i) == t.is_self_map(n, i) by {}
+    assert forall|n: PFN, i: nat| #[trigger] t2.entry_vpn_base(n, i) == t.entry_vpn_base(n, i) by {}
+
+    assert(t2.store_wf()) by {
+        assert forall|p: PFN| t2.contains(p) implies (#[trigger] t2.pages()[p].wf()
+            && t2.pages()[p].pfn() == p) by {
+            assert(t.contains(p));
+        }
+    }
+    assert(t2.tree_inv()) by {
+        assert(t2.contains(t2.root()));
+        assert(t2.links_wf()) by {
+            assert forall|n: PFN| t2.contains(n) implies #[trigger] t2.node_wf(n) by {
+                assert(t.contains(n) && t.node_wf(n));
+            }
+        }
+        assert(t2.tree_wf()) by {
+            assert forall|n: PFN| #![trigger t2.contains(n)]
+                t2.contains(n) && t2.level(n) == ROOT_LEVEL implies n == t2.root() by {
+                assert(t.contains(n));
+            }
+            assert(t2.interior_at(t2.root(), IDX_SELFMAP) && t2.entry(
+                t2.root(),
+                IDX_SELFMAP,
+            ).target == t2.root());
+            assert forall|n1: PFN, i1: nat, n2: PFN, i2: nat|
+                (#[trigger] t2.interior_at(n1, i1) && #[trigger] t2.interior_at(n2, i2) && t2.entry(
+                    n1,
+                    i1,
+                ).target == t2.entry(n2, i2).target) implies (n1 == n2 && i1 == i2) by {
+                assert(t.interior_at(n1, i1) && t.interior_at(n2, i2));
+            }
+            assert forall|c: PFN| #![trigger t2.contains(c)]
+                t2.contains(c) implies exists|n: PFN, i: nat|
+                #[trigger] t2.interior_at(n, i) && t2.entry(n, i).target == c by {
+                assert(t.contains(c));
+                let w = choose|n: PFN, i: nat|
+                    #![trigger t.interior_at(n, i)]
+                    t.interior_at(n, i) && t.entry(n, i).target == c;
+                assert(t2.interior_at(w.0, w.1) && t2.entry(w.0, w.1).target == c);
+            }
+        }
+        assert(t2.ad_pinned()) by {
+            assert forall|n: PFN, i: nat|
+                (t2.contains(n) && i < ENTRIES && t2.node(n).e.dom().contains(i)) implies entry_pinned(
+                    #[trigger] t2.entry(n, i),
+                ) by {}
+        }
+    }
+    assert(t2.interiors_permissive()) by {
+        assert forall|n: PFN, i: nat| #[trigger] t2.interior_at(n, i) implies permissive(
+            t2.entry(n, i),
+        ) by {
+            assert(t.interior_at(n, i));
+        }
+    }
+    assert(t2.xlate_base_consistent()) by {
+        assert(t2.xlate_base(t2.root()) == 0);
+        assert forall|p: PFN, i: nat| (#[trigger] t2.interior_at(p, i) && !t2.is_self_map(p, i))
+            implies t2.xlate_base(t2.entry(p, i).target) == t2.entry_vpn_base(p, i) by {
+            assert(t.interior_at(p, i) && !t.is_self_map(p, i));
+        }
+    }
+    assert(t2.xlate_base_aligned()) by {
+        assert forall|n: PFN| #[trigger] t2.contains(n) implies t2.xlate_base(n) % span(
+            (t2.level(n) + 1) as nat,
+        ) == 0 by {
+            assert(t.contains(n));
+        }
+    }
+}
+
+/// Record a user mapping: write the data leaf `pte` into the absent, user-region
+/// slot `(node, idx)` (the level-`level(node)` leaf the caller's descent reached for
+/// the target page) and record it in `va_map` at its base vpn. Maintains the full
+/// table + mapping invariant; after it, `walk` of any covered vpn agrees with the
+/// record (`lemma_mapping_walk_coupling`). The caller proves the local facts: the
+/// slot is free, `pte` is a valid leaf for the target frame, the base is in the user
+/// region, and the new vpn/frame ranges do not overlap any existing mapping.
+pub fn map<V: PtPage>(
+    node_va: VA,
+    Ghost(node): Ghost<PFN>,
+    idx: usize,
+    pte: V::Pte,
+    Tracked(perms): Tracked<&mut PageTablePerms<V>>,
+)
+    requires
+        old(perms).wf(),
+        old(perms).mapping_wf(),
+        node_va == old(perms).node_va(node),
+        idx < 512,
+        old(perms).contains(node),
+        old(perms).level(node) <= 2,
+        !old(perms).entry(node, idx as nat).present,
+        old(perms).valid_leaf_write(node, idx as nat, V::decode(pte)),
+        V::decode(pte).present,
+        in_user_region(old(perms).entry_vpn_base(node, idx as nat)),
+        forall|b2: VPage| #[trigger]
+            old(perms).va_map().dom().contains(b2) ==> {
+                let s = size_of_level(old(perms).level(node)).pages();
+                let bb = old(perms).entry_vpn_base(node, idx as nat);
+                let f = V::decode(pte).target;
+                &&& (bb + s <= b2 || b2 + old(perms).va_map()[b2].size.pages() <= bb)
+                &&& (f + s <= old(perms).va_map()[b2].frame || old(perms).va_map()[b2].frame
+                    + old(perms).va_map()[b2].size.pages() <= f)
+            },
+    ensures
+        final(perms).wf(),
+        final(perms).mapping_wf(),
+        final(perms).va_map().dom().contains(old(perms).entry_vpn_base(node, idx as nat)),
+{
+    let ghost t0 = *perms;
+    let ghost e = V::decode(pte);
+    let ghost b = t0.entry_vpn_base(node, idx as nat);
+    table_set_entry::<V>(node_va, Ghost(node), idx, pte, Tracked(perms));
+    let ghost tmid = *perms;
+    proof {
+        // record the mapping (a ghost va_map insert).
+        let mm = tmid.vmap_of_leaf(node, idx as nat);
+        perms.va_map_ = perms.va_map_.insert(b, mm);
+        let t1 = *perms;
+        // recording the mapping keeps wf / xlate_wf (they ignore va_map).
+        assert forall|n: PFN| #[trigger] t1.xlate_base(n) == tmid.xlate_base(n) by {}
+        lemma_va_map_irrelevant::<V>(tmid, t1);
+        // The insert keeps nodes/levels, so t1's structure == tmid's == t0-with-leaf.
+        assert forall|m: PFN| #[trigger] t1.node(m) == tmid.node(m) by {}
+        assert forall|m: PFN| #[trigger] t1.level(m) == tmid.level(m) by {}
+        assert(e.target % span(t0.level(node)) == 0);  // valid_leaf_write + e.present
+        assert(t1.vmap_of_leaf(node, idx as nat) == mm);
+        assert(t1.va_map() == t0.va_map().insert(b, t1.vmap_of_leaf(node, idx as nat)));
+        // relationship facts the records lemma needs (chain t1 == tmid == t0+leaf).
+        assert(t1.node(node) == t0.node(node).update(idx as nat, e));
+        assert forall|m: PFN| m != node implies #[trigger] t1.node(m) == t0.node(m) by {}
+        assert forall|m: PFN| #[trigger] t1.level(m) == t0.level(m) by {}
+        assert forall|m: PFN| #[trigger] t1.xlate_base(m) == t0.xlate_base(m) by {}
+        assert(t1.pages().dom() == t0.pages().dom());
+        // disjointness in the lemma's exact (inner-let) form.
+        assert forall|b2: VPage| #[trigger] t0.va_map().dom().contains(b2) implies {
+            let s = t1.vmap_of_leaf(node, idx as nat).size.pages();
+            let f = t1.vmap_of_leaf(node, idx as nat).frame;
+            &&& (b + s <= b2 || b2 + t0.va_map()[b2].size.pages() <= b)
+            &&& (f + s <= t0.va_map()[b2].frame || t0.va_map()[b2].frame
+                + t0.va_map()[b2].size.pages() <= f)
+        } by {
+            assert(t1.vmap_of_leaf(node, idx as nat).size.pages() == size_of_level(
+                t0.level(node),
+            ).pages());
+            assert(t1.vmap_of_leaf(node, idx as nat).frame == e.target);
+        }
+        lemma_map_records_mapping_inv::<V>(t0, t1, node, idx as nat, e, b);
+        assert(t1.mapping_wf());
+        assert(t1.va_map().dom().contains(b));
+    }
+}
+
+/// Remove a user mapping: clear the data leaf at `(node, idx)` - the leaf the
+/// caller's walk reached for the target page - and drop it from `va_map`. Maintains
+/// the table + mapping invariant. The caller proves the local facts: the slot is the
+/// recorded user leaf, and it is the unique leaf at its base (the walk found it).
+pub fn unmap<V: PtPage>(
+    node_va: VA,
+    Ghost(node): Ghost<PFN>,
+    idx: usize,
+    Tracked(perms): Tracked<&mut PageTablePerms<V>>,
+)
+    requires
+        old(perms).wf(),
+        old(perms).mapping_wf(),
+        node_va == old(perms).node_va(node),
+        idx < 512,
+        old(perms).contains(node),
+        old(perms).level(node) <= 2,
+        old(perms).leaf_at(node, idx as nat),
+        in_user_region(old(perms).entry_vpn_base(node, idx as nat)),
+        old(perms).va_map().dom().contains(old(perms).entry_vpn_base(node, idx as nat)),
+        forall|n2: PFN, i2: nat|
+            (#[trigger] old(perms).leaf_at(n2, i2) && old(perms).entry_vpn_base(n2, i2) == old(
+                perms,
+            ).entry_vpn_base(node, idx as nat)) ==> (n2 == node && i2 == idx),
+    ensures
+        final(perms).wf(),
+        final(perms).mapping_wf(),
+        !final(perms).va_map().dom().contains(old(perms).entry_vpn_base(node, idx as nat)),
+{
+    let ghost t0 = *perms;
+    let ghost b = t0.entry_vpn_base(node, idx as nat);
+    proof {
+        assert(!t0.interior_at(node, idx as nat));  // leaf_at => not interior
+    }
+    let absent = V::make_absent();
+    table_set_entry::<V>(node_va, Ghost(node), idx, absent, Tracked(perms));
+    let ghost tmid = *perms;
+    proof {
+        // drop the mapping key.
+        perms.va_map_ = perms.va_map_.remove(b);
+        let t1 = *perms;
+        assert forall|n: PFN| #[trigger] t1.xlate_base(n) == tmid.xlate_base(n) by {}
+        lemma_va_map_irrelevant::<V>(tmid, t1);
+        // chain t1 == tmid == t0-with-cleared-leaf.
+        assert forall|m: PFN| #[trigger] t1.node(m) == tmid.node(m) by {}
+        assert forall|m: PFN| #[trigger] t1.level(m) == tmid.level(m) by {}
+        assert(t1.node(node) == t0.node(node).update(idx as nat, entry_absent()));
+        assert forall|m: PFN| m != node implies #[trigger] t1.node(m) == t0.node(m) by {}
+        assert forall|m: PFN| #[trigger] t1.level(m) == t0.level(m) by {}
+        assert forall|m: PFN| #[trigger] t1.xlate_base(m) == t0.xlate_base(m) by {}
+        assert(t1.pages().dom() == t0.pages().dom());
+        assert(t1.va_map() == t0.va_map().remove(b));
+        lemma_unmap_clears_mapping_inv::<V>(t0, t1, node, idx as nat, b);
+        assert(t1.mapping_wf());
+        assert(!t1.va_map().dom().contains(b));
     }
 }
 
