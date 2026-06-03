@@ -25,7 +25,9 @@ use crate::specs::node::{
 };
 use crate::specs::perm::{PA, VA, pfn_of_pa};
 use crate::specs::table_proof::*;
-use crate::specs::table_split::{is_split_full, is_split_sub, lemma_split_full, lemma_split_sub};
+use crate::specs::table_split::{
+    is_join, is_split_full, is_split_sub, lemma_join, lemma_split_full, lemma_split_sub,
+};
 use crate::stubs::SvsmError;
 use vstd::prelude::*;
 
@@ -1292,7 +1294,8 @@ pub fn split<V: PtPage>(
     let tracked sub_perms;
     proof {
         assert(sset.subset_of(perms.pages_.dom())) by {
-            assert forall|n: PFN| sset.contains(n) implies perms.pages_.dom().contains(n) by {
+            assert forall|n: PFN| #[trigger] sset.contains(n) implies perms.pages_.dom().contains(n)
+                by {
                 assert(t0.in_subtree(idx as nat, n));  // => t0.contains(n); dom unchanged by clear
             }
         }
@@ -1376,6 +1379,136 @@ pub fn split<V: PtPage>(
         lemma_split_sub::<V>(t0, ts, idx as nat);
     }
     Tracked(sub_perms)
+}
+
+/// Check a subtree view `sub` (from an earlier `split(idx)`, possibly `map`/`unmap`ed)
+/// back IN under top-level entry `idx`: re-link `root[idx]` to the subtree root, and
+/// merge the subtree's node permissions and `va_map` slice back into the full table.
+/// The slot must be free, the stores disjoint, and - the one thing `split`+`map` do
+/// not enforce - the subtree's data frames must be disjoint from the full table's.
+pub fn join<V: PtPage>(
+    root_va: VA,
+    idx: usize,
+    sub_root: usize,
+    sub: Tracked<PageTablePerms<V>>,
+    Tracked(perms): Tracked<&mut PageTablePerms<V>>,
+)
+    requires
+        old(perms).wf(),
+        old(perms).mapping_wf(),
+        old(perms).sub_idx() is None,
+        root_va == old(perms).node_va(old(perms).root()),
+        idx < 512,
+        idx as nat != IDX_SELFMAP,
+        !old(perms).entry(old(perms).root(), idx as nat).present,
+        sub@.wf(),
+        sub@.mapping_wf(),
+        sub@.sub_idx() == Some(idx as nat),
+        sub_root as nat == sub@.root(),
+        old(perms).pages().dom().disjoint(sub@.pages().dom()),
+        forall|b1: VPage, b2: VPage|
+            (#[trigger] old(perms).va_map().dom().contains(b1) && #[trigger] sub@.va_map().dom().contains(
+                b2,
+            )) ==> {
+                let f1 = old(perms).va_map()[b1].frame;
+                let f2 = sub@.va_map()[b2].frame;
+                f1 + old(perms).va_map()[b1].size.pages() <= f2 || f2 + sub@.va_map()[b2].size.pages()
+                    <= f1
+            },
+    ensures
+        final(perms).wf(),
+        final(perms).mapping_wf(),
+        final(perms).root() == old(perms).root(),
+        final(perms).sub_idx() is None,
+{
+    broadcast use lemma_node_struct_wf, lemma_node_pfn;
+
+    let ghost pf0 = *perms;
+    let ghost ps = sub@;
+    let ghost r = pf0.root();
+    let ghost ps_dom = sub@.pages().dom();
+
+    // 1. re-link root[idx] -> the subtree root.
+    let interior = V::make_interior(sub_root);
+    let tracked root_perm = perms.pages_.tracked_borrow_mut(r);
+    node_set_entry::<V>(root_va, Tracked(root_perm), idx, interior);
+    let ghost t1 = *perms;
+
+    // 2. merge the subtree's permissions and ghost maps back in.
+    let tracked sps = sub.get();
+    let tracked PageTablePerms {
+        root_: _,
+        pages_: sub_pages,
+        xlate_base_: sub_xb,
+        va_map_: sub_vm,
+        sub_idx_: _,
+    } = sps;
+    proof {
+        perms.pages_.tracked_union_prefer_right(sub_pages);
+        // Bases: ps nodes read from the subtree, pf nodes keep theirs (a total map, so
+        // it is robust to `xlate_base_` not covering every PFN).
+        perms.xlate_base_ = Map::new(
+            |n: PFN| pf0.pages().dom().contains(n) || ps_dom.contains(n),
+            |n: PFN| if ps_dom.contains(n) { sub_xb[n] } else { pf0.xlate_base_[n] },
+        );
+        perms.va_map_ = perms.va_map_.union_prefer_right(sub_vm);
+    }
+
+    // 3. discharge the join relation and conclude validity.
+    proof {
+        let tj = *perms;
+        assert(t1.node(r) == pf0.node(r).update(idx as nat, interior_entry(ps.root())));
+        // contains / node / level / xlate_base relations.
+        assert(tj.pages().dom() =~= pf0.pages().dom().union(ps.pages().dom()));
+        assert forall|n: PFN| #[trigger] tj.contains(n) <==> (pf0.contains(n) || ps.contains(n))
+            by {}
+        assert(tj.node(r) == pf0.node(r).update(idx as nat, interior_entry(ps.root()))) by {
+            assert(!ps.pages().dom().contains(r));  // disjoint
+            assert(tj.pages()[r] == t1.pages()[r]);
+        }
+        assert forall|n: PFN| #[trigger] tj.contains(n) && ps.contains(n) implies {
+            &&& tj.node(n) == ps.node(n)
+            &&& tj.level(n) == ps.level(n)
+            &&& tj.xlate_base(n) == ps.xlate_base(n)
+        } by {
+            assert(tj.pages()[n] == ps.pages()[n]);  // prefer-right on ps's domain
+            assert(ps_dom.contains(n) && tj.xlate_base(n) == sub_xb[n]);  // Map::new
+            assert(ps.xlate_base(n) == sub_xb[n]);
+        }
+        assert forall|n: PFN| #[trigger] tj.contains(n) && !ps.contains(n) implies {
+            &&& (n != r ==> tj.node(n) == pf0.node(n))
+            &&& tj.level(n) == pf0.level(n)
+            &&& tj.xlate_base(n) == pf0.xlate_base(n)
+        } by {
+            assert(!ps_dom.contains(n));
+            assert(tj.pages()[n] == t1.pages()[n]);  // not in right map
+            if n != r {
+                assert(t1.pages()[n] == pf0.pages()[n]);  // relink only touched r
+            }
+        }
+        assert forall|b: VPage| #[trigger] tj.va_map().dom().contains(b) <==> (pf0.va_map().dom().contains(
+            b,
+        ) || ps.va_map().dom().contains(b)) by {}
+        assert forall|b: VPage| #[trigger] tj.va_map().dom().contains(b) implies {
+            &&& (ps.va_map().dom().contains(b) ==> tj.va_map()[b] == ps.va_map()[b])
+            &&& (!ps.va_map().dom().contains(b) ==> tj.va_map()[b] == pf0.va_map()[b])
+        } by {}
+        assert(is_join(pf0, ps, tj, idx as nat));
+
+        // store_wf of the merged store.
+        assert forall|p: PFN| tj.contains(p) implies (#[trigger] tj.pages()[p].wf()
+            && tj.pages()[p].pfn() == p) by {
+            if ps.contains(p) {
+                assert(tj.pages()[p] == ps.pages()[p]);
+            } else {
+                assert(tj.pages()[p] == t1.pages()[p]);
+                if p != r {
+                    assert(t1.pages()[p] == pf0.pages()[p]);
+                }
+            }
+        }
+        lemma_join::<V>(pf0, ps, tj, idx as nat);
+    }
 }
 
 // =====================================================================
