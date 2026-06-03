@@ -1230,4 +1230,1115 @@ pub proof fn lemma_split_full<V: PtPage>(t0: PageTablePerms<V>, tf: PageTablePer
     lemma_split_full_mapping(t0, tf, idx);
 }
 
+// =====================================================================
+// Join: a subtree view merges back into a full table (reverse of split)
+// =====================================================================
+
+/// A subtree view (`sub_idx` Some) has no node at the top paging level: its root
+/// sits at `ROOT_LEVEL-1` and every other node has a parent one level higher,
+/// capped at `ROOT_LEVEL`.
+pub proof fn lemma_subtree_no_root_level<V: PtPage>(t: PageTablePerms<V>, n: PFN)
+    requires
+        t.store_wf(),
+        t.tree_inv(),
+        t.sub_idx() is Some,
+        t.contains(n),
+    ensures
+        t.level(n) != ROOT_LEVEL,
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    let r = t.root();
+    if t.level(n) == ROOT_LEVEL {
+        assert(t.level(r) == t.root_level() && t.root_level() == (ROOT_LEVEL - 1) as nat);
+        assert(n != r);
+        assert(t.tree_wf());
+        let (p, k): (PFN, nat) = choose|p: PFN, k: nat|
+            #![trigger t.interior_at(p, k)]
+            t.interior_at(p, k) && t.entry(p, k).target == n;
+        assert(t.interior_at(p, k) && t.entry(p, k).target == n);
+        assert(t.node_wf(p));
+        assert(!t.is_self_map(p, k));  // sub_idx Some
+        assert(t.level(p) == t.level(n) + 1);  // > ROOT_LEVEL, contradicting the bound
+        assert(false);
+    }
+}
+
+/// Every node of a subtree view checked out at top-level entry `idx` has its base in
+/// entry `idx`'s window (the reverse of the split closure: the view is self-contained
+/// in its bucket). Proven by induction up to the subtree root, whose base is
+/// `idx*span(ROOT_LEVEL)`.
+pub proof fn lemma_subtree_nodes_in_window<V: PtPage>(t: PageTablePerms<V>, idx: nat, n: PFN)
+    requires
+        t.store_wf(),
+        t.tree_inv(),
+        t.sub_idx() == Some::<nat>(idx),
+        t.xlate_base_consistent(),
+        t.xlate_base_aligned(),
+        t.contains(n),
+    ensures
+        idx * span(ROOT_LEVEL) <= t.xlate_base(n) < (idx + 1) * span(ROOT_LEVEL),
+    decreases ROOT_LEVEL - t.level(n),
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    let r = t.root();
+    let big = span(ROOT_LEVEL);
+    lemma_span_pos(ROOT_LEVEL);
+    lemma_subtree_no_root_level(t, n);
+    assert(t.level(n) <= ROOT_LEVEL && t.level(n) != ROOT_LEVEL);
+    if t.level(n) >= t.root_level() {
+        // top of the subtree: the root, based at idx*big.
+        assert(t.level(n) == t.root_level());
+        assert(n == r);  // root-unique
+        assert(t.xlate_base(r) == t.root_base() && t.root_base() == idx * big);  // consistent
+        assert(idx * big <= idx * big < (idx + 1) * big) by (nonlinear_arith)
+            requires
+                big > 0,
+        ;
+    } else {
+        // below the top: walk up to the (already in-window) parent, whose link keeps
+        // this node in the same window.
+        assert(n != r);
+        assert(t.tree_wf());
+        let (p, k): (PFN, nat) = choose|p: PFN, k: nat|
+            #![trigger t.interior_at(p, k)]
+            t.interior_at(p, k) && t.entry(p, k).target == n;
+        assert(t.interior_at(p, k) && t.entry(p, k).target == n);
+        assert(t.node_wf(p));
+        assert(!t.is_self_map(p, k));  // sub_idx Some
+        assert(t.level(p) == t.level(n) + 1);
+        assert(t.level(p) <= ROOT_LEVEL);
+        lemma_subtree_no_root_level(t, p);
+        assert(t.level(p) < ROOT_LEVEL);
+        lemma_subtree_nodes_in_window(t, idx, p);  // IH: base(p) in idx's window
+        lemma_edge_in_bucket(t, p, k, idx);  // base(n) in idx's window
+    }
+}
+
+/// In a full table, a non-root node whose base is in entry `idx`'s window forces
+/// `root[idx]` to be a present interior link (the node's ancestor chain enters the
+/// window through it). Contrapositive: if `root[idx]` is absent, the window is empty.
+pub proof fn lemma_window_implies_root_link<V: PtPage>(t: PageTablePerms<V>, idx: nat, n: PFN)
+    requires
+        t.store_wf(),
+        t.tree_inv(),
+        t.sub_idx() is None,
+        t.xlate_base_consistent(),
+        t.xlate_base_aligned(),
+        idx < ENTRIES,
+        t.contains(n),
+        n != t.root(),
+        idx * span(ROOT_LEVEL) <= t.xlate_base(n) < (idx + 1) * span(ROOT_LEVEL),
+    ensures
+        t.interior_at(t.root(), idx),
+    decreases ROOT_LEVEL - t.level(n),
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    let r = t.root();
+    let big = span(ROOT_LEVEL);
+    lemma_span_pos(ROOT_LEVEL);
+    assert(t.level(r) == ROOT_LEVEL);  // tree_inv + full table
+    assert(t.tree_wf());
+    // n != root has a parent (p, k).
+    let (p, k): (PFN, nat) = choose|p: PFN, k: nat|
+        #![trigger t.interior_at(p, k)]
+        t.interior_at(p, k) && t.entry(p, k).target == n;
+    assert(t.interior_at(p, k) && t.entry(p, k).target == n);
+    assert(t.node_wf(p));
+    assert(!t.is_self_map(p, k)) by {
+        if t.is_self_map(p, k) {
+            assert(t.entry(p, k).target == p);  // self-map targets itself => p == n, levels clash
+        }
+    }
+    assert(t.level(p) == t.level(n) + 1 && t.level(p) <= ROOT_LEVEL);
+    if p == r {
+        // base(n) == k*big lands in idx's window, so k == idx.
+        assert(t.xlate_base(n) == t.entry_vpn_base(r, k) && t.xlate_base(r) == 0);
+        assert(t.entry_vpn_base(r, k) == k * big);
+        assert(k * big <= t.xlate_base(n) < (k + 1) * big) by (nonlinear_arith)
+            requires
+                big > 0,
+                t.xlate_base(n) == k * big,
+        ;
+        lemma_windows_disjoint(t.xlate_base(n) as int, k, idx);  // k == idx
+    } else {
+        // p is also in idx's window (its link keeps n there), and is closer to the root.
+        assert(t.level(p) < ROOT_LEVEL);  // p != root, root-unique
+        let wp = lemma_base_has_window(t.xlate_base(p));
+        lemma_edge_in_bucket(t, p, k, wp);  // base(n) in wp's window
+        lemma_windows_disjoint(t.xlate_base(n) as int, wp, idx);  // wp == idx
+        lemma_window_implies_root_link(t, idx, p);
+    }
+}
+
+/// `tj` is the full table obtained by merging subtree view `ps` back under entry
+/// `idx` of full remainder `pf`: re-link `root[idx] -> ps.root()`, take the union of
+/// the node stores and `va_map`s. The two stores are disjoint and `pf[idx]` is free.
+pub open spec fn is_join<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+) -> bool {
+    &&& tj.root() == pf.root()
+    &&& tj.sub_idx() is None
+    &&& (forall|n: PFN| #[trigger]
+        tj.contains(n) <==> (pf.contains(n) || ps.contains(n)))
+    &&& tj.node(pf.root()) == pf.node(pf.root()).update(idx, interior_entry(ps.root()))
+    &&& (forall|n: PFN| #[trigger] tj.contains(n) && ps.contains(n) ==> {
+        &&& tj.node(n) == ps.node(n)
+        &&& tj.level(n) == ps.level(n)
+        &&& tj.xlate_base(n) == ps.xlate_base(n)
+    })
+    &&& (forall|n: PFN| #[trigger] tj.contains(n) && !ps.contains(n) ==> {
+        &&& (n != pf.root() ==> tj.node(n) == pf.node(n))
+        &&& tj.level(n) == pf.level(n)
+        &&& tj.xlate_base(n) == pf.xlate_base(n)
+    })
+    &&& (forall|b: VPage| #[trigger]
+        tj.va_map().dom().contains(b) <==> (pf.va_map().dom().contains(b)
+            || ps.va_map().dom().contains(b)))
+    &&& (forall|b: VPage| #[trigger] tj.va_map().dom().contains(b) ==> {
+        &&& (ps.va_map().dom().contains(b) ==> tj.va_map()[b] == ps.va_map()[b])
+        &&& (!ps.va_map().dom().contains(b) ==> tj.va_map()[b] == pf.va_map()[b])
+    })
+}
+
+/// Entry/level bridge for the join: on a `ps` node `tj` reads like `ps`; on a non-root
+/// `pf`-only node like `pf`; at the root it is `pf`'s row with `idx` re-linked to `c`.
+proof fn lemma_join_bridge<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+)
+    requires
+        pf.store_wf(),
+        ps.store_wf(),
+        idx < ENTRIES,
+        pf.pages().dom().disjoint(ps.pages().dom()),
+        is_join(pf, ps, tj, idx),
+    ensures
+        forall|n: PFN, i: nat| #![trigger ps.interior_at(n, i)] #![trigger tj.entry(n, i)]
+            ps.contains(n) ==> {
+                &&& tj.interior_at(n, i) == ps.interior_at(n, i)
+                &&& tj.leaf_at(n, i) == ps.leaf_at(n, i)
+                &&& tj.entry(n, i) == ps.entry(n, i)
+            },
+        forall|n: PFN, i: nat| #![trigger pf.interior_at(n, i)] #![trigger tj.entry(n, i)]
+            (pf.contains(n) && n != pf.root()) ==> {
+                &&& tj.interior_at(n, i) == pf.interior_at(n, i)
+                &&& tj.leaf_at(n, i) == pf.leaf_at(n, i)
+                &&& tj.entry(n, i) == pf.entry(n, i)
+            },
+        forall|i: nat| #![trigger tj.entry(pf.root(), i)]
+            (i != idx ==> tj.entry(pf.root(), i) == pf.entry(pf.root(), i)) && (i == idx
+                ==> tj.entry(pf.root(), i) == interior_entry(ps.root())),
+{
+    broadcast use lemma_node_struct_wf;
+
+    let r = pf.root();
+    assert(pf.node(r).e.dom().contains(idx));
+    assert forall|n: PFN, i: nat| #![trigger ps.interior_at(n, i)]
+        ps.contains(n) implies {
+            &&& tj.interior_at(n, i) == ps.interior_at(n, i)
+            &&& tj.leaf_at(n, i) == ps.leaf_at(n, i)
+            &&& tj.entry(n, i) == ps.entry(n, i)
+        } by {
+        assert(tj.contains(n) && !pf.contains(n));  // disjoint
+        assert(tj.node(n) == ps.node(n) && tj.level(n) == ps.level(n));
+        assert(tj.entry(n, i) == ps.entry(n, i));
+        assert(tj.interior_at(n, i) == ps.interior_at(n, i));
+        assert(tj.leaf_at(n, i) == ps.leaf_at(n, i));
+    }
+    assert forall|n: PFN, i: nat| #![trigger pf.interior_at(n, i)]
+        (pf.contains(n) && n != r) implies {
+            &&& tj.interior_at(n, i) == pf.interior_at(n, i)
+            &&& tj.leaf_at(n, i) == pf.leaf_at(n, i)
+            &&& tj.entry(n, i) == pf.entry(n, i)
+        } by {
+        assert(tj.contains(n) && !ps.contains(n));  // disjoint
+        assert(tj.node(n) == pf.node(n) && tj.level(n) == pf.level(n));
+        assert(tj.entry(n, i) == pf.entry(n, i));
+        assert(tj.interior_at(n, i) == pf.interior_at(n, i));
+        assert(tj.leaf_at(n, i) == pf.leaf_at(n, i));
+    }
+    assert forall|i: nat| #![trigger tj.entry(r, i)]
+        (i != idx ==> tj.entry(r, i) == pf.entry(r, i)) && (i == idx ==> tj.entry(r, i)
+            == interior_entry(ps.root())) by {
+        assert(tj.node(r) == pf.node(r).update(idx, interior_entry(ps.root())));
+        assert(tj.entry(r, i) == tj.node(r).e[i]);
+        assert(tj.node(r).e[i] == pf.node(r).e.insert(idx, interior_entry(ps.root()))[i]);
+        assert(pf.entry(r, i) == pf.node(r).e[i]);
+    }
+}
+
+/// `node_wf` of a `ps` node survives the join (its links stay inside `ps`, hence live).
+proof fn lemma_join_node_wf_ps<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+    n: PFN,
+)
+    requires
+        pf.store_wf(),
+        ps.store_wf(),
+        ps.wf(),
+        ps.sub_idx() == Some::<nat>(idx),
+        idx < ENTRIES,
+        pf.pages().dom().disjoint(ps.pages().dom()),
+        is_join(pf, ps, tj, idx),
+        ps.contains(n),
+    ensures
+        tj.node_wf(n),
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    lemma_join_bridge(pf, ps, tj, idx);
+    assert(ps.node_wf(n));  // ps.links_wf
+    lemma_subtree_no_root_level(ps, n);
+    assert forall|i: nat|
+        #![trigger tj.entry(n, i)]
+        (i < ENTRIES && tj.node(n).e.dom().contains(i) && tj.entry(n, i).present) implies {
+            let e = tj.entry(n, i);
+            if tj.level(n) == 0 || e.leaf {
+                &&& tj.level(n) <= 2
+                &&& e.target % span(tj.level(n)) == 0
+            } else {
+                &&& tj.contains(e.target)
+                &&& if tj.is_self_map(n, i) {
+                    e.target == n
+                } else {
+                    tj.level(n) >= 1 && tj.level(e.target) == tj.level(n) - 1
+                }
+            }
+        } by {
+        assert(tj.contains(n) && tj.level(n) == ps.level(n));  // is_join level
+        assert(tj.entry(n, i) == ps.entry(n, i));  // bridge
+        assert(!tj.is_self_map(n, i));  // tj.sub_idx None but ps node level < ROOT_LEVEL
+        if tj.level(n) != 0 && !tj.entry(n, i).leaf {
+            assert(ps.interior_at(n, i));
+            assert(ps.contains(ps.entry(n, i).target));  // ps.node_wf
+            assert(tj.contains(ps.entry(n, i).target));  // union
+        }
+    }
+}
+
+/// `node_wf` of a `pf` node survives the join; at the root the re-linked slot points
+/// one level down to `c`, the rest is `pf`'s unchanged row.
+proof fn lemma_join_node_wf_pf<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+    n: PFN,
+)
+    requires
+        pf.store_wf(),
+        pf.wf(),
+        ps.store_wf(),
+        ps.wf(),
+        ps.sub_idx() == Some::<nat>(idx),
+        pf.sub_idx() is None,
+        idx < ENTRIES,
+        idx != IDX_SELFMAP,
+        !pf.entry(pf.root(), idx).present,
+        pf.pages().dom().disjoint(ps.pages().dom()),
+        is_join(pf, ps, tj, idx),
+        tj.contains(n),
+        !ps.contains(n),
+    ensures
+        tj.node_wf(n),
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    lemma_join_bridge(pf, ps, tj, idx);
+    let r = pf.root();
+    let c = ps.root();
+    assert(pf.contains(n) && pf.node_wf(n));  // n in union, not in ps
+    assert(pf.level(r) == ROOT_LEVEL);
+    assert(ps.contains(c) && ps.level(c) == (ROOT_LEVEL - 1) as nat);
+    assert forall|i: nat|
+        #![trigger tj.entry(n, i)]
+        (i < ENTRIES && tj.node(n).e.dom().contains(i) && tj.entry(n, i).present) implies {
+            let e = tj.entry(n, i);
+            if tj.level(n) == 0 || e.leaf {
+                &&& tj.level(n) <= 2
+                &&& e.target % span(tj.level(n)) == 0
+            } else {
+                &&& tj.contains(e.target)
+                &&& if tj.is_self_map(n, i) {
+                    e.target == n
+                } else {
+                    tj.level(n) >= 1 && tj.level(e.target) == tj.level(n) - 1
+                }
+            }
+        } by {
+        assert(tj.contains(n) && !ps.contains(n) && tj.level(n) == pf.level(n));  // is_join level
+        if n == r && i == idx {
+            // the re-linked slot: interior to c, one level down, not the self-map.
+            assert(tj.entry(r, idx) == interior_entry(c));  // bridge root row
+            assert(tj.level(r) == ROOT_LEVEL);
+            assert(tj.contains(c) && tj.level(c) == ps.level(c));  // is_join, c in ps
+            assert(tj.level(c) == (ROOT_LEVEL - 1) as nat);
+            assert(!tj.is_self_map(r, idx));  // idx != IDX_SELFMAP
+        } else {
+            assert(tj.entry(n, i) == pf.entry(n, i));  // bridge (n != r or i != idx)
+            assert(tj.is_self_map(n, i) == pf.is_self_map(n, i));
+            if pf.interior_at(n, i) {
+                assert(pf.contains(pf.entry(n, i).target));  // pf.node_wf
+                assert(tj.contains(pf.entry(n, i).target));  // union
+                if pf.is_self_map(n, i) {
+                    assert(pf.entry(n, i).target == n);
+                }
+            }
+        }
+    }
+}
+
+/// Injectivity survives the join: `pf` links target `pf` nodes, `ps` links target `ps`
+/// nodes (the disjoint stores), and the one new link `root[idx] -> c` is `c`'s only
+/// parent (a subtree root has no incoming edge).
+proof fn lemma_join_injective<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+    n1: PFN,
+    i1: nat,
+    n2: PFN,
+    i2: nat,
+)
+    requires
+        pf.store_wf(),
+        pf.wf(),
+        ps.store_wf(),
+        ps.wf(),
+        ps.sub_idx() == Some::<nat>(idx),
+        pf.sub_idx() is None,
+        idx < ENTRIES,
+        idx != IDX_SELFMAP,
+        !pf.entry(pf.root(), idx).present,
+        pf.pages().dom().disjoint(ps.pages().dom()),
+        is_join(pf, ps, tj, idx),
+        tj.interior_at(n1, i1),
+        tj.interior_at(n2, i2),
+        tj.entry(n1, i1).target == tj.entry(n2, i2).target,
+    ensures
+        n1 == n2 && i1 == i2,
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    lemma_join_bridge(pf, ps, tj, idx);
+    let r = pf.root();
+    let c = ps.root();
+    assert(ps.contains(c));
+    // classify each interior: a ps link (target in ps), the new root[idx] link
+    // (target c), or a pf link off root[idx] (target in pf, disjoint from ps).
+    lemma_join_edge_class(pf, ps, tj, idx, n1, i1);
+    lemma_join_edge_class(pf, ps, tj, idx, n2, i2);
+    let new1 = n1 == r && i1 == idx;
+    let new2 = n2 == r && i2 == idx;
+    if new1 && new2 {
+        // both are the unique new link.
+    } else if new1 || new2 {
+        // exactly one is the new link (target c); the other targets c too, but no
+        // edge other than root[idx] reaches c (ps root has no parent; pf has no c).
+        let (m, j): (PFN, nat) = if new1 { (n2, i2) } else { (n1, i1) };
+        assert(tj.entry(m, j).target == c);
+        if ps.contains(m) {
+            assert(ps.interior_at(m, j) && ps.entry(m, j).target == c);
+            lemma_root_incoming_is_self_map(ps, m, j);  // => is_self_map, impossible in subtree
+        } else {
+            assert(pf.contains(tj.entry(m, j).target));  // pf edge class
+            assert(pf.contains(c) && ps.contains(c));  // disjoint stores: contradiction
+        }
+    } else {
+        // neither is the new link: both are ps edges, both pf edges, or a mixed pair
+        // whose common target would have to live in both disjoint stores.
+        if ps.contains(n1) && ps.contains(n2) {
+            assert(ps.interior_at(n1, i1) && ps.interior_at(n2, i2));  // bridge
+            assert(ps.entry(n1, i1).target == ps.entry(n2, i2).target);
+            assert(ps.tree_wf());  // injectivity
+        } else if !ps.contains(n1) && !ps.contains(n2) {
+            assert(pf.interior_at(n1, i1) && pf.interior_at(n2, i2));  // bridge
+            assert(pf.entry(n1, i1).target == pf.entry(n2, i2).target);
+            assert(pf.tree_wf());  // injectivity
+        } else {
+            // mixed: the shared target sits in both ps and pf - impossible (disjoint).
+            if ps.contains(n1) {
+                assert(ps.contains(tj.entry(n1, i1).target));  // edge class, ps side
+                assert(pf.contains(tj.entry(n2, i2).target));  // edge class, pf side
+            } else {
+                assert(pf.contains(tj.entry(n1, i1).target));
+                assert(ps.contains(tj.entry(n2, i2).target));
+            }
+        }
+    }
+}
+
+/// Each `tj` interior edge is either a `ps` edge (live `ps` target), the new
+/// `root[idx]` edge (target `c`), or a `pf` edge off `root[idx]` (live `pf` target).
+proof fn lemma_join_edge_class<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+    n: PFN,
+    i: nat,
+)
+    requires
+        pf.store_wf(),
+        pf.wf(),
+        ps.store_wf(),
+        ps.wf(),
+        ps.sub_idx() == Some::<nat>(idx),
+        idx < ENTRIES,
+        !pf.entry(pf.root(), idx).present,
+        pf.pages().dom().disjoint(ps.pages().dom()),
+        is_join(pf, ps, tj, idx),
+        tj.interior_at(n, i),
+    ensures
+        (n == pf.root() && i == idx && tj.entry(n, i).target == ps.root()) || (ps.contains(n)
+            && ps.contains(tj.entry(n, i).target)) || (pf.contains(n) && !ps.contains(n) && (n
+            != pf.root() || i != idx) && pf.contains(tj.entry(n, i).target)),
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    lemma_join_bridge(pf, ps, tj, idx);
+    let r = pf.root();
+    assert(tj.contains(n));
+    if ps.contains(n) {
+        assert(ps.interior_at(n, i));
+        assert(ps.node_wf(n) && ps.contains(ps.entry(n, i).target));
+    } else if n == r && i == idx {
+        assert(tj.entry(r, idx) == interior_entry(ps.root()));
+    } else {
+        assert(pf.contains(n) && pf.interior_at(n, i));  // off the re-linked slot
+        assert(pf.node_wf(n) && pf.contains(pf.entry(n, i).target));
+    }
+}
+
+/// Connectivity survives the join: `pf` nodes keep their `pf` parents (the root row
+/// off `idx` is unchanged), `c` is parented by the new `root[idx]` link, and the
+/// other `ps` nodes keep their `ps` parents.
+proof fn lemma_join_connected<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+    x: PFN,
+)
+    requires
+        pf.store_wf(),
+        pf.wf(),
+        ps.store_wf(),
+        ps.wf(),
+        ps.sub_idx() == Some::<nat>(idx),
+        pf.sub_idx() is None,
+        idx < ENTRIES,
+        idx != IDX_SELFMAP,
+        !pf.entry(pf.root(), idx).present,
+        pf.pages().dom().disjoint(ps.pages().dom()),
+        is_join(pf, ps, tj, idx),
+        tj.contains(x),
+        x != pf.root(),
+    ensures
+        exists|p: PFN, k: nat| #[trigger] tj.interior_at(p, k) && tj.entry(p, k).target == x,
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    lemma_join_bridge(pf, ps, tj, idx);
+    let r = pf.root();
+    let c = ps.root();
+    assert(tj.contains(r) && !ps.contains(r));  // r in pf, disjoint stores
+    assert(tj.level(r) == pf.level(r) && pf.level(r) == ROOT_LEVEL);  // is_join
+    if ps.contains(x) {
+        if x == c {
+            assert(tj.entry(r, idx) == interior_entry(c));  // bridge root row
+            assert(tj.interior_at(r, idx) && tj.entry(r, idx).target == c);
+        } else {
+            assert(ps.tree_wf());
+            let (p, k): (PFN, nat) = choose|p: PFN, k: nat|
+                #![trigger ps.interior_at(p, k)]
+                ps.interior_at(p, k) && ps.entry(p, k).target == x;
+            assert(ps.interior_at(p, k) && ps.entry(p, k).target == x);
+            assert(tj.interior_at(p, k) && tj.entry(p, k).target == x);
+        }
+    } else {
+        assert(pf.contains(x) && pf.tree_wf());
+        let (p, k): (PFN, nat) = choose|p: PFN, k: nat|
+            #![trigger pf.interior_at(p, k)]
+            pf.interior_at(p, k) && pf.entry(p, k).target == x;
+        assert(pf.interior_at(p, k) && pf.entry(p, k).target == x);
+        // (p, k) != (root, idx): that slot is absent in pf, hence not an interior.
+        assert(p != r || k != idx);
+        if p == r {
+            assert(tj.entry(r, k) == pf.entry(r, k));  // bridge root row, k != idx
+            assert(tj.interior_at(r, k));  // pf interior + equal entry/level
+        } else {
+            assert(tj.interior_at(p, k) == pf.interior_at(p, k));  // bridge pf node
+        }
+        assert(tj.interior_at(p, k) && tj.entry(p, k).target == x);
+    }
+}
+
+/// The merged table `tj` is a valid tree.
+#[verifier::rlimit(100)]
+pub proof fn lemma_join_tree<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+)
+    requires
+        pf.store_wf(),
+        pf.wf(),
+        pf.mapping_wf(),
+        pf.sub_idx() is None,
+        ps.store_wf(),
+        ps.wf(),
+        ps.mapping_wf(),
+        ps.sub_idx() == Some::<nat>(idx),
+        idx < ENTRIES,
+        idx != IDX_SELFMAP,
+        !pf.entry(pf.root(), idx).present,
+        pf.pages().dom().disjoint(ps.pages().dom()),
+        tj.store_wf(),
+        is_join(pf, ps, tj, idx),
+    ensures
+        tj.tree_inv(),
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    lemma_join_bridge(pf, ps, tj, idx);
+    let r = pf.root();
+    let c = ps.root();
+    assert(pf.level(r) == ROOT_LEVEL && tj.contains(r));
+    assert(ps.contains(c) && ps.level(c) == (ROOT_LEVEL - 1) as nat);  // ps.tree_inv
+    assert(tj.contains(c) && tj.level(c) == ps.level(c));  // is_join, c in ps
+    assert(tj.level(c) == (ROOT_LEVEL - 1) as nat);
+    assert(!ps.contains(r));  // r in pf, disjoint
+    assert(tj.level(r) == pf.level(r) && tj.root_level() == ROOT_LEVEL);  // is_join
+    assert(!pf.interior_at(r, idx));  // slot absent
+    assert(tj.entry(r, idx) == interior_entry(c));
+    assert(tj.interior_at(r, idx) && tj.entry(r, idx).target == c);
+    assert(!tj.is_self_map(r, idx));  // idx != IDX_SELFMAP
+
+    assert(tj.links_wf()) by {
+        assert forall|n: PFN| tj.contains(n) implies #[trigger] tj.node_wf(n) by {
+            if ps.contains(n) {
+                lemma_join_node_wf_ps(pf, ps, tj, idx, n);
+            } else {
+                lemma_join_node_wf_pf(pf, ps, tj, idx, n);
+            }
+        }
+    }
+
+    assert(tj.tree_wf()) by {
+        assert forall|n: PFN| #![trigger tj.contains(n)]
+            tj.contains(n) && tj.level(n) == tj.root_level() implies n == r by {
+            if ps.contains(n) {
+                lemma_subtree_no_root_level(ps, n);
+                assert(tj.level(n) == ps.level(n));
+            } else {
+                assert(pf.contains(n) && tj.level(n) == pf.level(n));
+            }
+        }
+        assert(tj.self_map_inv()) by {
+            assert(pf.interior_at(r, IDX_SELFMAP) && pf.entry(r, IDX_SELFMAP).target == r);
+            assert(IDX_SELFMAP != idx);
+            assert(tj.entry(r, IDX_SELFMAP) == pf.entry(r, IDX_SELFMAP));
+            assert(tj.interior_at(r, IDX_SELFMAP));
+        }
+        assert forall|n1: PFN, i1: nat, n2: PFN, i2: nat|
+            (#[trigger] tj.interior_at(n1, i1) && #[trigger] tj.interior_at(n2, i2) && tj.entry(
+                n1,
+                i1,
+            ).target == tj.entry(n2, i2).target) implies (n1 == n2 && i1 == i2) by {
+            lemma_join_injective(pf, ps, tj, idx, n1, i1, n2, i2);
+        }
+        assert forall|x: PFN| #![trigger tj.contains(x)]
+            (tj.contains(x) && x != r) implies exists|p: PFN, k: nat|
+            #[trigger] tj.interior_at(p, k) && tj.entry(p, k).target == x by {
+            lemma_join_connected(pf, ps, tj, idx, x);
+        }
+    }
+
+    assert(tj.ad_pinned()) by {
+        assert forall|n: PFN, i: nat|
+            (tj.contains(n) && i < ENTRIES && tj.node(n).e.dom().contains(i)) implies entry_pinned(
+                #[trigger] tj.entry(n, i),
+            ) by {
+            if ps.contains(n) {
+                assert(tj.entry(n, i) == ps.entry(n, i));
+            } else if n == r && i == idx {
+                assert(tj.entry(r, idx) == interior_entry(c));  // pinned by construction
+            } else {
+                assert(pf.contains(n) && tj.entry(n, i) == pf.entry(n, i));
+            }
+        }
+    }
+}
+
+/// A subtree view's `va_map` key (and its whole mapping range) lies in entry `idx`'s
+/// window: the recording leaf is in the subtree, hence in the window.
+pub proof fn lemma_ps_key_in_window<V: PtPage>(ps: PageTablePerms<V>, idx: nat, b: VPage)
+    requires
+        ps.store_wf(),
+        ps.tree_inv(),
+        ps.sub_idx() == Some::<nat>(idx),
+        ps.xlate_base_consistent(),
+        ps.xlate_base_aligned(),
+        ps.mapping_inv(),
+        ps.va_map().dom().contains(b),
+    ensures
+        idx * span(ROOT_LEVEL) <= b,
+        b + ps.va_map()[b].size.pages() <= (idx + 1) * span(ROOT_LEVEL),
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    let big = span(ROOT_LEVEL);
+    let m = ps.va_map()[b];
+    let ii = pt_index(b, level_of_size(m.size));
+    let n = choose|n: PFN| ps.records_leaf(b, m, n, ii);  // mapping_inv (Q)
+    assert(ps.records_leaf(b, m, n, ii));
+    let l = ps.level(n);
+    assert(l == level_of_size(m.size) && level_of_size(m.size) <= 2 && l < ROOT_LEVEL);
+    lemma_subtree_nodes_in_window(ps, idx, n);  // base(n) in idx's window
+    lemma_node_window_in_bucket(ps, n, idx);  // base(n) + span(l+1) <= (idx+1)*big
+    lemma_size_level_roundtrip(l);  // span(l) == m.size.pages()
+    lemma_span_pos(l);
+    assert(span((l + 1) as nat) == 512 * span(l));
+    assert(ii < ENTRIES);  // pt_index
+    assert(b == ps.xlate_base(n) + ii * span(l));  // records_leaf: entry_vpn_base
+    assert(idx * big <= b) by (nonlinear_arith)
+        requires
+            idx * big <= ps.xlate_base(n),
+            b == ps.xlate_base(n) + ii * span(l),
+            ii * span(l) >= 0,
+            span(l) >= 0,
+            ii >= 0,
+    ;
+    assert(b + m.size.pages() <= (idx + 1) * big) by (nonlinear_arith)
+        requires
+            b == ps.xlate_base(n) + ii * span(l),
+            m.size.pages() == span(l),
+            span((l + 1) as nat) == 512 * span(l),
+            ps.xlate_base(n) + span((l + 1) as nat) <= (idx + 1) * big,
+            ii + 1 <= 512,
+            span(l) >= 0,
+    ;
+}
+
+/// A full table with `root[idx]` absent has no `va_map` key in entry `idx`'s window:
+/// any recording leaf would force the slot to be present.
+pub proof fn lemma_pf_key_not_in_window<V: PtPage>(pf: PageTablePerms<V>, idx: nat, b: VPage)
+    requires
+        pf.store_wf(),
+        pf.tree_inv(),
+        pf.sub_idx() is None,
+        pf.xlate_base_consistent(),
+        pf.xlate_base_aligned(),
+        pf.mapping_inv(),
+        idx < ENTRIES,
+        !pf.entry(pf.root(), idx).present,
+        pf.va_map().dom().contains(b),
+    ensures
+        b + pf.va_map()[b].size.pages() <= idx * span(ROOT_LEVEL) || (idx + 1) * span(ROOT_LEVEL)
+            <= b,
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    let big = span(ROOT_LEVEL);
+    lemma_span_pos(ROOT_LEVEL);
+    let m = pf.va_map()[b];
+    let ii = pt_index(b, level_of_size(m.size));
+    let n = choose|n: PFN| pf.records_leaf(b, m, n, ii);  // mapping_inv (Q)
+    assert(pf.records_leaf(b, m, n, ii));
+    let l = pf.level(n);
+    assert(l == level_of_size(m.size) && level_of_size(m.size) <= 2 && l < ROOT_LEVEL);
+    assert(pf.contains(n) && n != pf.root());  // a leaf node is below the root
+    let w = lemma_base_has_window(pf.xlate_base(n));
+    assert(!pf.interior_at(pf.root(), idx));  // slot absent
+    assert(w != idx) by {
+        if w == idx {
+            lemma_window_implies_root_link(pf, idx, n);  // => interior_at(root, idx), absurd
+        }
+    }
+    lemma_node_window_in_bucket(pf, n, w);  // base(n) + span(l+1) <= (w+1)*big
+    lemma_size_level_roundtrip(l);
+    lemma_span_pos(l);
+    assert(span((l + 1) as nat) == 512 * span(l));
+    assert(ii < ENTRIES);
+    assert(b == pf.xlate_base(n) + ii * span(l));
+    // the whole mapping range sits in w's window, which is not idx's.
+    assert(w * big <= b) by (nonlinear_arith)
+        requires
+            w * big <= pf.xlate_base(n),
+            b == pf.xlate_base(n) + ii * span(l),
+            ii * span(l) >= 0,
+    ;
+    assert(b + m.size.pages() <= (w + 1) * big) by (nonlinear_arith)
+        requires
+            b == pf.xlate_base(n) + ii * span(l),
+            m.size.pages() == span(l),
+            span((l + 1) as nat) == 512 * span(l),
+            pf.xlate_base(n) + span((l + 1) as nat) <= (w + 1) * big,
+            ii + 1 <= 512,
+            span(l) >= 0,
+    ;
+    if w < idx {
+        assert((w + 1) * big <= idx * big) by (nonlinear_arith)
+            requires
+                w + 1 <= idx,
+                big >= 0,
+        ;
+    } else {
+        assert((idx + 1) * big <= w * big) by (nonlinear_arith)
+            requires
+                idx + 1 <= w,
+                big >= 0,
+        ;
+    }
+}
+
+/// The merged table `tj` carries the user-mapping invariant `mapping_wf`. The only
+/// cross-half obligation that is not geometric - frame disjointness between the two
+/// halves' mappings - is a hypothesis (the caller must not have re-used data frames).
+#[verifier::rlimit(100)]
+pub proof fn lemma_join_mapping<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+)
+    requires
+        pf.store_wf(),
+        pf.wf(),
+        pf.mapping_wf(),
+        pf.sub_idx() is None,
+        ps.store_wf(),
+        ps.wf(),
+        ps.mapping_wf(),
+        ps.sub_idx() == Some::<nat>(idx),
+        idx < ENTRIES,
+        idx != IDX_SELFMAP,
+        !pf.entry(pf.root(), idx).present,
+        pf.pages().dom().disjoint(ps.pages().dom()),
+        tj.store_wf(),
+        tj.tree_inv(),
+        is_join(pf, ps, tj, idx),
+        // data frames of the two halves' mappings are disjoint (the part split/map
+        // does not guarantee on its own).
+        forall|b1: VPage, b2: VPage|
+            (#[trigger] pf.va_map().dom().contains(b1) && #[trigger] ps.va_map().dom().contains(b2))
+                ==> {
+                let f1 = pf.va_map()[b1].frame;
+                let f2 = ps.va_map()[b2].frame;
+                f1 + pf.va_map()[b1].size.pages() <= f2 || f2 + ps.va_map()[b2].size.pages() <= f1
+            },
+    ensures
+        tj.mapping_wf(),
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    lemma_join_bridge(pf, ps, tj, idx);
+    let r = pf.root();
+    let c = ps.root();
+    let big = span(ROOT_LEVEL);
+    lemma_span_pos(ROOT_LEVEL);
+    assert(pf.level(r) == ROOT_LEVEL && !ps.contains(r) && tj.level(r) == ROOT_LEVEL);
+    assert(ps.contains(c) && ps.level(c) == (ROOT_LEVEL - 1) as nat);
+    assert(tj.contains(c) && tj.level(c) == ps.level(c));
+    assert(ps.xlate_base(c) == ps.root_base() && ps.root_base() == idx * big);  // ps consistent
+    assert(tj.xlate_base(c) == ps.xlate_base(c));  // is_join
+    assert(tj.xlate_base(r) == pf.xlate_base(r) && pf.xlate_base(r) == 0);  // pf consistent
+
+    // permissive interiors: pf side, the new permissive link, ps side.
+    assert(tj.interiors_permissive()) by {
+        assert forall|n: PFN, i: nat| #[trigger] tj.interior_at(n, i) implies permissive(
+            tj.entry(n, i),
+        ) by {
+            lemma_join_edge_class(pf, ps, tj, idx, n, i);
+            if ps.contains(n) {
+                assert(ps.interior_at(n, i) && tj.entry(n, i) == ps.entry(n, i));
+            } else if n == r && i == idx {
+                assert(tj.entry(r, idx) == interior_entry(c));  // permissive by construction
+            } else {
+                assert(pf.interior_at(n, i) && tj.entry(n, i) == pf.entry(n, i));
+            }
+        }
+    }
+    // xlate_base_consistent.
+    assert(tj.xlate_base_consistent()) by {
+        assert(tj.xlate_base(tj.root()) == tj.root_base());  // both 0
+        assert forall|p: PFN, i: nat| (#[trigger] tj.interior_at(p, i) && !tj.is_self_map(p, i))
+            implies tj.xlate_base(tj.entry(p, i).target) == tj.entry_vpn_base(p, i) by {
+            lemma_join_edge_class(pf, ps, tj, idx, p, i);
+            if ps.contains(p) {
+                let tgt = ps.entry(p, i).target;
+                assert(ps.interior_at(p, i) && tj.entry(p, i) == ps.entry(p, i));
+                assert(!ps.is_self_map(p, i));  // ps subtree
+                assert(ps.contains(tgt) && tj.contains(tgt));
+                assert(tj.xlate_base(tgt) == ps.xlate_base(tgt));  // is_join, tgt in ps
+                assert(tj.level(p) == ps.level(p) && tj.xlate_base(p) == ps.xlate_base(p));
+            } else if p == r && i == idx {
+                assert(tj.entry(r, idx).target == c);
+                assert(tj.xlate_base(c) == idx * big);
+                assert(tj.entry_vpn_base(r, idx) == tj.xlate_base(r) + idx * span(tj.level(r)));
+                assert(tj.entry_vpn_base(r, idx) == idx * big);
+            } else {
+                let tgt = pf.entry(p, i).target;
+                assert(pf.interior_at(p, i) && tj.entry(p, i) == pf.entry(p, i));
+                assert(tj.is_self_map(p, i) == pf.is_self_map(p, i));
+                assert(!pf.is_self_map(p, i));
+                assert(pf.contains(tgt) && tj.contains(tgt));
+                assert(tj.xlate_base(tgt) == pf.xlate_base(tgt));  // is_join, tgt in pf
+                assert(tj.level(p) == pf.level(p) && tj.xlate_base(p) == pf.xlate_base(p));
+            }
+        }
+    }
+    // xlate_base_aligned.
+    assert(tj.xlate_base_aligned()) by {
+        assert forall|n: PFN| #[trigger] tj.contains(n) implies tj.xlate_base(n) % span(
+            (tj.level(n) + 1) as nat,
+        ) == 0 by {
+            if ps.contains(n) {
+                assert(tj.xlate_base(n) == ps.xlate_base(n) && tj.level(n) == ps.level(n));
+            } else {
+                assert(pf.contains(n) && tj.xlate_base(n) == pf.xlate_base(n) && tj.level(n)
+                    == pf.level(n));
+            }
+        }
+    }
+
+    lemma_join_mapping_inv(pf, ps, tj, idx);
+}
+
+/// The user-mapping invariant `mapping_inv` of the merged table: each half's records
+/// and leaves survive; disjointness holds within each half and across (frames by
+/// hypothesis, vpns because the two halves live in disjoint top-level windows).
+#[verifier::rlimit(100)]
+pub proof fn lemma_join_mapping_inv<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+)
+    requires
+        pf.store_wf(),
+        pf.wf(),
+        pf.mapping_wf(),
+        pf.sub_idx() is None,
+        ps.store_wf(),
+        ps.wf(),
+        ps.mapping_wf(),
+        ps.sub_idx() == Some::<nat>(idx),
+        idx < ENTRIES,
+        idx != IDX_SELFMAP,
+        !pf.entry(pf.root(), idx).present,
+        pf.pages().dom().disjoint(ps.pages().dom()),
+        tj.store_wf(),
+        tj.tree_inv(),
+        is_join(pf, ps, tj, idx),
+        forall|b1: VPage, b2: VPage|
+            (#[trigger] pf.va_map().dom().contains(b1) && #[trigger] ps.va_map().dom().contains(b2))
+                ==> {
+                let f1 = pf.va_map()[b1].frame;
+                let f2 = ps.va_map()[b2].frame;
+                f1 + pf.va_map()[b1].size.pages() <= f2 || f2 + ps.va_map()[b2].size.pages() <= f1
+            },
+    ensures
+        tj.mapping_inv(),
+{
+    broadcast use lemma_node_level_bound, lemma_node_struct_wf;
+
+    lemma_join_bridge(pf, ps, tj, idx);
+    let r = pf.root();
+    let big = span(ROOT_LEVEL);
+    lemma_span_pos(ROOT_LEVEL);
+    assert(tj.level(r) == ROOT_LEVEL) by {
+        assert(!ps.contains(r) && tj.level(r) == pf.level(r) && pf.level(r) == ROOT_LEVEL);
+    }
+    // the two halves' key sets are disjoint (one in idx's window, the other not).
+    assert forall|b: VPage|
+        (#[trigger] pf.va_map().dom().contains(b) && #[trigger] ps.va_map().dom().contains(b))
+            implies false by {
+        lemma_pf_key_not_in_window(pf, idx, b);
+        lemma_ps_key_in_window(ps, idx, b);
+    }
+
+    // (Q): every tj key is recorded by a surviving leaf of its own half.
+    assert forall|b: VPage| #[trigger] tj.va_map().dom().contains(b) implies {
+        let m = tj.va_map()[b];
+        &&& in_user_region(b)
+        &&& b % m.size.pages() == 0
+        &&& m.frame % m.size.pages() == 0
+        &&& exists|w: PFN| tj.records_leaf(b, m, w, pt_index(b, level_of_size(m.size)))
+    } by {
+        if ps.va_map().dom().contains(b) {
+            let m = ps.va_map()[b];
+            assert(tj.va_map()[b] == m);  // is_join
+            let ii = pt_index(b, level_of_size(m.size));
+            let w = choose|w: PFN| ps.records_leaf(b, m, w, ii);
+            assert(ps.records_leaf(b, m, w, ii));
+            assert(ps.contains(w) && tj.contains(w));
+            assert(tj.level(w) == ps.level(w) && tj.xlate_base(w) == ps.xlate_base(w));
+            assert(tj.records_leaf(b, m, w, ii));
+        } else {
+            assert(pf.va_map().dom().contains(b));  // union
+            let m = pf.va_map()[b];
+            assert(tj.va_map()[b] == m);
+            let ii = pt_index(b, level_of_size(m.size));
+            let w = choose|w: PFN| pf.records_leaf(b, m, w, ii);
+            assert(pf.records_leaf(b, m, w, ii));
+            assert(pf.contains(w) && w != r);  // a leaf is below the root
+            assert(tj.contains(w));
+            assert(tj.level(w) == pf.level(w) && tj.xlate_base(w) == pf.xlate_base(w));
+            assert(tj.records_leaf(b, m, w, ii));
+        }
+    }
+    // (P): every tj user-region leaf is recorded in its half.
+    assert forall|n: PFN, i: nat|
+        (#[trigger] tj.leaf_at(n, i) && in_user_region(tj.entry_vpn_base(n, i)))
+            implies tj.va_map().dom().contains(tj.entry_vpn_base(n, i)) by {
+        assert(tj.contains(n));
+        assert(n != r) by {
+            if n == r {
+                assert(tj.node_wf(r));  // tj.tree_inv: no present leaf at ROOT_LEVEL
+            }
+        }
+        if ps.contains(n) {
+            assert(ps.leaf_at(n, i) && tj.entry_vpn_base(n, i) == ps.entry_vpn_base(n, i));
+            assert(ps.va_map().dom().contains(ps.entry_vpn_base(n, i)));  // ps (P)
+        } else {
+            assert(pf.contains(n) && pf.leaf_at(n, i) && tj.entry_vpn_base(n, i)
+                == pf.entry_vpn_base(n, i));
+            assert(pf.va_map().dom().contains(pf.entry_vpn_base(n, i)));  // pf (P)
+        }
+    }
+    // (C) frame disjointness and (D) vpn disjointness.
+    assert forall|b1: VPage, b2: VPage|
+        (b1 != b2 && #[trigger] tj.va_map().dom().contains(b1) && #[trigger] tj.va_map().dom().contains(
+            b2,
+        )) implies ({
+            let f1 = tj.va_map()[b1].frame;
+            let f2 = tj.va_map()[b2].frame;
+            &&& (f1 + tj.va_map()[b1].size.pages() <= f2 || f2 + tj.va_map()[b2].size.pages() <= f1)
+            &&& (b1 + tj.va_map()[b1].size.pages() <= b2 || b2 + tj.va_map()[b2].size.pages() <= b1)
+        }) by {
+        lemma_join_disjoint_pair(pf, ps, tj, idx, b1, b2);
+    }
+}
+
+/// Frame- and vpn-disjointness for a pair of distinct `tj` keys: within a half it is
+/// inherited; across halves frames are the hypothesis and vpns follow from the
+/// disjoint windows.
+proof fn lemma_join_disjoint_pair<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+    b1: VPage,
+    b2: VPage,
+)
+    requires
+        pf.store_wf(),
+        pf.wf(),
+        pf.mapping_wf(),
+        pf.sub_idx() is None,
+        ps.store_wf(),
+        ps.wf(),
+        ps.mapping_wf(),
+        ps.sub_idx() == Some::<nat>(idx),
+        idx < ENTRIES,
+        !pf.entry(pf.root(), idx).present,
+        is_join(pf, ps, tj, idx),
+        forall|c1: VPage, c2: VPage|
+            (#[trigger] pf.va_map().dom().contains(c1) && #[trigger] ps.va_map().dom().contains(c2))
+                ==> {
+                let f1 = pf.va_map()[c1].frame;
+                let f2 = ps.va_map()[c2].frame;
+                f1 + pf.va_map()[c1].size.pages() <= f2 || f2 + ps.va_map()[c2].size.pages() <= f1
+            },
+        b1 != b2,
+        tj.va_map().dom().contains(b1),
+        tj.va_map().dom().contains(b2),
+    ensures
+        ({
+            let f1 = tj.va_map()[b1].frame;
+            let f2 = tj.va_map()[b2].frame;
+            &&& (f1 + tj.va_map()[b1].size.pages() <= f2 || f2 + tj.va_map()[b2].size.pages() <= f1)
+            &&& (b1 + tj.va_map()[b1].size.pages() <= b2 || b2 + tj.va_map()[b2].size.pages() <= b1)
+        }),
+{
+    let big = span(ROOT_LEVEL);
+    lemma_span_pos(ROOT_LEVEL);
+    let in1_ps = ps.va_map().dom().contains(b1);
+    let in2_ps = ps.va_map().dom().contains(b2);
+    if in1_ps && in2_ps {
+        assert(tj.va_map()[b1] == ps.va_map()[b1] && tj.va_map()[b2] == ps.va_map()[b2]);
+    } else if !in1_ps && !in2_ps {
+        assert(pf.va_map().dom().contains(b1) && pf.va_map().dom().contains(b2));
+        assert(tj.va_map()[b1] == pf.va_map()[b1] && tj.va_map()[b2] == pf.va_map()[b2]);
+    } else {
+        // cross pair: one key in pf (window != idx), one in ps (window idx).
+        let (pb, sb): (VPage, VPage) = if in1_ps { (b2, b1) } else { (b1, b2) };
+        assert(pf.va_map().dom().contains(pb) && ps.va_map().dom().contains(sb));
+        assert(tj.va_map()[pb] == pf.va_map()[pb] && tj.va_map()[sb] == ps.va_map()[sb]);
+        lemma_pf_key_not_in_window(pf, idx, pb);  // pf range outside idx's window
+        lemma_ps_key_in_window(ps, idx, sb);  // ps range inside idx's window
+        assert(pb + pf.va_map()[pb].size.pages() <= sb || sb + ps.va_map()[sb].size.pages() <= pb)
+            by (nonlinear_arith)
+            requires
+                big > 0,
+                pb + pf.va_map()[pb].size.pages() <= idx * big || (idx + 1) * big <= pb,
+                idx * big <= sb,
+                sb + ps.va_map()[sb].size.pages() <= (idx + 1) * big,
+        ;
+    }
+}
+
+/// The subtree view `ps` merges back under entry `idx` of `pf` into a valid,
+/// mapping-complete full table `tj` (inverse of `split`).
+pub proof fn lemma_join<V: PtPage>(
+    pf: PageTablePerms<V>,
+    ps: PageTablePerms<V>,
+    tj: PageTablePerms<V>,
+    idx: nat,
+)
+    requires
+        pf.store_wf(),
+        pf.wf(),
+        pf.mapping_wf(),
+        pf.sub_idx() is None,
+        ps.store_wf(),
+        ps.wf(),
+        ps.mapping_wf(),
+        ps.sub_idx() == Some::<nat>(idx),
+        idx < ENTRIES,
+        idx != IDX_SELFMAP,
+        !pf.entry(pf.root(), idx).present,
+        pf.pages().dom().disjoint(ps.pages().dom()),
+        tj.store_wf(),
+        is_join(pf, ps, tj, idx),
+        forall|b1: VPage, b2: VPage|
+            (#[trigger] pf.va_map().dom().contains(b1) && #[trigger] ps.va_map().dom().contains(b2))
+                ==> {
+                let f1 = pf.va_map()[b1].frame;
+                let f2 = ps.va_map()[b2].frame;
+                f1 + pf.va_map()[b1].size.pages() <= f2 || f2 + ps.va_map()[b2].size.pages() <= f1
+            },
+    ensures
+        tj.wf(),
+        tj.mapping_wf(),
+{
+    lemma_join_tree(pf, ps, tj, idx);
+    lemma_join_mapping(pf, ps, tj, idx);
+}
+
 } // verus!
