@@ -96,6 +96,7 @@ pub proof fn lemma_node_on_path_eq<V: PtPage>(t: PageTablePerms<V>, n: PFN, vpn:
         t.store_wf(),
         t.contains(t.root()),
         t.tree_inv(),
+        t.sub_idx() is None,
         t.xlate_base_consistent(),
         t.xlate_base_aligned(),
         t.contains(n),
@@ -108,12 +109,14 @@ pub proof fn lemma_node_on_path_eq<V: PtPage>(t: PageTablePerms<V>, n: PFN, vpn:
 
     let l = t.level(n);
     assert(t.pages()[n].wf());  // store_wf => the node level bound applies
+    assert(t.level(t.root()) == ROOT_LEVEL);  // tree_inv + full table
     if l >= ROOT_LEVEL {
         assert(l == ROOT_LEVEL);
         assert(n == t.root());  // tree_wf: unique top-level node
     } else {
-        // connectivity: n has a (unique) parent interior link (p, idx).
+        // connectivity: n (!= root, being below the top) has a (unique) parent link.
         assert(t.tree_wf());
+        assert(n != t.root());
         let (p, idx): (PFN, nat) = choose|p: PFN, idx: nat|
             #![trigger t.interior_at(p, idx)]
             t.interior_at(p, idx) && t.entry(p, idx).target == n;
@@ -167,6 +170,7 @@ pub proof fn lemma_reflects_walk<V: PtPage>(t: PageTablePerms<V>)
         t.store_wf(),
         t.contains(t.root()),
         t.tree_inv(),
+        t.sub_idx() is None,
         t.xlate_base_consistent(),
         t.xlate_base_aligned(),
     ensures
@@ -283,6 +287,7 @@ pub proof fn lemma_mapping_walk_coupling<V: PtPage>(t: PageTablePerms<V>, b: VPa
     requires
         t.store_wf(),
         t.tree_inv(),
+        t.sub_idx() is None,
         t.xlate_base_consistent(),
         t.xlate_base_aligned(),
         t.interiors_permissive(),
@@ -361,6 +366,7 @@ pub proof fn lemma_leaf_write_preserves_tree_inv<V: PtPage>(
         t0.tree_inv(),
         t0.valid_leaf_write(pfn, idx, e),
         t1.root() == t0.root(),
+        t1.sub_idx() == t0.sub_idx(),
         t1.pages().dom() == t0.pages().dom(),
         t1.node(pfn) == t0.node(pfn).update(idx, e),
         forall|m: PFN| m != pfn ==> #[trigger] t1.node(m) == t0.node(m),
@@ -371,6 +377,7 @@ pub proof fn lemma_leaf_write_preserves_tree_inv<V: PtPage>(
     broadcast use lemma_node_struct_wf;
 
     let r = t0.root();
+    assert(t1.root_level() == t0.root_level() && t1.root_base() == t0.root_base());
     // node(pfn) has its full entry set, so inserting at idx (already present)
     // leaves its domain - and hence `contains` and node domains - unchanged.
     assert(t0.node(pfn).e.dom().contains(idx));
@@ -394,7 +401,6 @@ pub proof fn lemma_leaf_write_preserves_tree_inv<V: PtPage>(
         }
     }
     assert(!t1.interior_at(pfn, idx));
-    assert(t0.interior_at(r, IDX_SELFMAP));
     assert(!t0.interior_at(pfn, idx));
     // An interior entry of t1 is not the edited slot, so its entry is unchanged.
     assert forall|n: PFN, i: nat| t1.interior_at(n, i) implies #[trigger] t1.entry(n, i) == t0.entry(
@@ -408,14 +414,20 @@ pub proof fn lemma_leaf_write_preserves_tree_inv<V: PtPage>(
     }
 
     // --- tree_wf, clause by clause -----------------------------------
-    // root is still the unique top-level node (levels/contains/root fixed).
+    // root is still the unique node at its level (levels/contains/root fixed).
     assert forall|n: PFN| #![trigger t1.contains(n)]
-        t1.contains(n) && t1.level(n) == ROOT_LEVEL implies n == r by {
+        t1.contains(n) && t1.level(n) == t1.root_level() implies n == r by {
         assert(t0.contains(n));
     }
-    // the self-map is unchanged (it is interior in t0, hence not the edited slot).
-    assert(t1.interior_at(r, IDX_SELFMAP));
-    assert(t1.entry(r, IDX_SELFMAP) == t0.entry(r, IDX_SELFMAP));
+    // the self-map (full table only) is unchanged: it is interior in t0, hence not
+    // the edited (leaf) slot.
+    assert(t1.self_map_inv()) by {
+        if t1.sub_idx() is None {
+            assert(t0.interior_at(r, IDX_SELFMAP) && t0.entry(r, IDX_SELFMAP).target == r);
+            assert(t1.interior_at(r, IDX_SELFMAP));
+            assert(t1.entry(r, IDX_SELFMAP) == t0.entry(r, IDX_SELFMAP));
+        }
+    }
     // injectivity: an interior entry of t1 is one of t0 with the same target.
     assert forall|n1: PFN, i1: nat, n2: PFN, i2: nat|
         (#[trigger] t1.interior_at(n1, i1) && #[trigger] t1.interior_at(n2, i2) && t1.entry(
@@ -425,9 +437,9 @@ pub proof fn lemma_leaf_write_preserves_tree_inv<V: PtPage>(
         assert(t0.interior_at(n1, i1));
         assert(t0.interior_at(n2, i2));
     }
-    // connectivity: t0's parent of c is still a parent in t1.
+    // connectivity: t0's parent of c (!= root) is still a parent in t1.
     assert forall|c: PFN| #![trigger t1.contains(c)]
-        t1.contains(c) implies exists|n: PFN, i: nat|
+        (t1.contains(c) && c != r) implies exists|n: PFN, i: nat|
         #[trigger] t1.interior_at(n, i) && t1.entry(n, i).target == c by {
         assert(t0.contains(c));
         let w = choose|n: PFN, i: nat|
@@ -473,6 +485,7 @@ pub proof fn lemma_leaf_write_preserves_xlate_wf<V: PtPage>(
         t0.xlate_wf(),
         t0.valid_leaf_write(pfn, idx, e),
         t1.root() == t0.root(),
+        t1.sub_idx() == t0.sub_idx(),
         t1.pages().dom() == t0.pages().dom(),
         t1.node(pfn) == t0.node(pfn).update(idx, e),
         forall|m: PFN| m != pfn ==> #[trigger] t1.node(m) == t0.node(m),
@@ -507,7 +520,8 @@ pub proof fn lemma_leaf_write_preserves_xlate_wf<V: PtPage>(
         }
     }
     assert(t1.xlate_base_consistent()) by {
-        assert(t1.xlate_base(t1.root()) == 0);
+        assert(t1.root_base() == t0.root_base());
+        assert(t1.xlate_base(t1.root()) == t1.root_base());
         assert forall|p: PFN, i: nat| (#[trigger] t1.interior_at(p, i) && !t1.is_self_map(p, i))
             implies t1.xlate_base(t1.entry(p, i).target) == t1.entry_vpn_base(p, i) by {
             assert(t0.interior_at(p, i));
@@ -780,6 +794,7 @@ pub proof fn lemma_link_child_preserves_tree_inv<V: PtPage>(
         !t0.contains(child),
         t1.store_wf(),
         t1.root() == t0.root(),
+        t1.sub_idx() == t0.sub_idx(),
         forall|c: PFN| #[trigger] t1.contains(c) <==> (c == child || t0.contains(c)),
         t1.node(child).empty(),
         t1.level(child) == t0.level(parent) - 1,
@@ -826,14 +841,23 @@ pub proof fn lemma_link_child_preserves_tree_inv<V: PtPage>(
     }
 
     // --- tree_wf, clause by clause -----------------------------------
+    assert(t1.root_level() == t0.root_level() && t1.root_base() == t0.root_base());
+    assert(t1.level(child) != t1.root_level());
     assert forall|n: PFN| #![trigger t1.contains(n)]
-        t1.contains(n) && t1.level(n) == ROOT_LEVEL implies n == r by {
+        t1.contains(n) && t1.level(n) == t1.root_level() implies n == r by {
         if n != child {
             assert(t0.contains(n));
         }
     }
-    assert(t1.interior_at(r, IDX_SELFMAP));
-    assert(t1.entry(r, IDX_SELFMAP) == t0.entry(r, IDX_SELFMAP));
+    // the self-map (full table only) is unchanged: not the (parent, idx) slot.
+    assert(t1.self_map_inv()) by {
+        if t1.sub_idx() is None {
+            assert(t0.interior_at(r, IDX_SELFMAP) && t0.entry(r, IDX_SELFMAP).target == r);
+            assert(!(parent == r && idx == IDX_SELFMAP));
+            assert(t1.interior_at(r, IDX_SELFMAP));
+            assert(t1.entry(r, IDX_SELFMAP) == t0.entry(r, IDX_SELFMAP));
+        }
+    }
     // injectivity: each interior entry of t1 is (parent,idx)->child, or a t0
     // interior with target in t0's store (so != child) - the two never collide.
     assert forall|n1: PFN, i1: nat, n2: PFN, i2: nat|
@@ -852,7 +876,7 @@ pub proof fn lemma_link_child_preserves_tree_inv<V: PtPage>(
     }
     // connectivity: child's parent is (parent, idx); t0 nodes keep their parents.
     assert forall|c: PFN| #![trigger t1.contains(c)]
-        t1.contains(c) implies exists|n: PFN, i: nat|
+        (t1.contains(c) && c != r) implies exists|n: PFN, i: nat|
         #[trigger] t1.interior_at(n, i) && t1.entry(n, i).target == c by {
         if c == child {
             assert(t1.interior_at(parent, idx) && t1.entry(parent, idx).target == child);
@@ -909,7 +933,7 @@ pub proof fn lemma_link_child_xlate_wf<V: PtPage>(
         !t0.node(parent).e[idx].present,
         !(parent == t0.root() && idx == IDX_SELFMAP),
         !t0.contains(child),
-        t0.xlate_base(t0.root()) == 0,
+        t1.sub_idx() == t0.sub_idx(),
         // freshness: no existing interior targets `child` (derived from tree_inv by
         // the caller, passed here so this context stays free of the tree soup).
         forall|n: PFN, i: nat| #[trigger] t0.interior_at(n, i) ==> t0.entry(n, i).target != child,
@@ -990,7 +1014,7 @@ pub proof fn lemma_link_child_consistent<V: PtPage>(
         t0.store_wf(),
         t0.xlate_base_consistent(),
         t0.contains(t0.root()),
-        t0.xlate_base(t0.root()) == 0,
+        t1.sub_idx() == t0.sub_idx(),
         t0.contains(parent),
         idx < ENTRIES,
         t0.level(parent) >= 1,
@@ -1021,7 +1045,9 @@ pub proof fn lemma_link_child_consistent<V: PtPage>(
     }
     assert(t1.entry(parent, idx) == ei);
     assert(t0.root() != child);  // child is fresh, root is live
-    assert(t1.xlate_base(t1.root()) == 0);  // root != child, base unchanged
+    assert(t1.root_base() == t0.root_base());
+    assert(t0.xlate_base(t0.root()) == t0.root_base());  // t0.xlate_base_consistent
+    assert(t1.xlate_base(t1.root()) == t1.root_base());  // root != child, base unchanged
     assert forall|p: PFN, i: nat| (#[trigger] t1.interior_at(p, i) && !t1.is_self_map(p, i)) implies
         t1.xlate_base(t1.entry(p, i).target) == t1.entry_vpn_base(p, i) by {
         if p == parent && i == idx {
@@ -1216,6 +1242,7 @@ pub proof fn lemma_link_child_preserves_mapping_wf<V: PtPage>(
         !(parent == t0.root() && idx == IDX_SELFMAP),
         !t0.contains(child),
         t1.root() == t0.root(),
+        t1.sub_idx() == t0.sub_idx(),
         forall|c: PFN| #[trigger] t1.contains(c) <==> (c == child || t0.contains(c)),
         t1.node(child).empty(),
         t1.level(child) == t0.level(parent) - 1,
@@ -1263,6 +1290,7 @@ pub proof fn lemma_unlink_node_wf<V: PtPage>(
         t1.node(n).wf(),
         t1.contains(n),
         n != child,
+        t1.sub_idx() == t0.sub_idx(),
         t1.entry(parent, idx) == entry_absent(),
         forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
         forall|c: PFN| #[trigger] t1.contains(c) <==> (c != child && t0.contains(c)),
@@ -1330,6 +1358,7 @@ pub proof fn lemma_unlink_links_wf<V: PtPage>(
         t0.entry(parent, idx).target == child,
         t0.node(child).empty(),
         t1.store_wf(),
+        t1.sub_idx() == t0.sub_idx(),
         forall|c: PFN| #[trigger] t1.contains(c) <==> (c != child && t0.contains(c)),
         t1.node(parent) == t0.node(parent).update(idx, entry_absent()),
         forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
@@ -1375,6 +1404,46 @@ pub proof fn lemma_unlink_links_wf<V: PtPage>(
     }
 }
 
+/// In any well-formed (sub)tree the only interior edge that can target the root is
+/// the full table's self-map; a subtree root has no incoming edge at all. Used to
+/// show a relinked/unlinked child is never the (sub)root.
+pub proof fn lemma_root_incoming_is_self_map<V: PtPage>(t: PageTablePerms<V>, n: PFN, i: nat)
+    requires
+        t.store_wf(),
+        t.tree_inv(),
+        t.interior_at(n, i),
+        t.entry(n, i).target == t.root(),
+    ensures
+        t.is_self_map(n, i),
+{
+    broadcast use lemma_node_struct_wf, lemma_node_level_bound;
+
+    let r = t.root();
+    assert(t.node_wf(n));
+    if t.sub_idx() is None {
+        // full table: the self-map targets the root; injectivity makes it unique.
+        assert(t.level(r) == ROOT_LEVEL);  // tree_inv: level(root) == root_level()
+        assert(t.interior_at(r, IDX_SELFMAP) && t.entry(r, IDX_SELFMAP).target == r);
+        assert(n == r && i == IDX_SELFMAP);  // injectivity
+    } else {
+        // subtree: no interior may target the root. `is_self_map` is false here, so
+        // `node_wf` puts the root one level below `n`, then `n` (!= root) would need
+        // a parent above ROOT_LEVEL - impossible.
+        assert(!t.is_self_map(n, i));
+        assert(t.level(n) >= 1 && t.level(r) == t.level(n) - 1);
+        assert(t.level(r) == t.root_level() && t.root_level() == (ROOT_LEVEL - 1) as nat);
+        assert(t.level(n) == ROOT_LEVEL);
+        assert(n != r);
+        let w = choose|g: PFN, j: nat|
+            #![trigger t.interior_at(g, j)]
+            t.interior_at(g, j) && t.entry(g, j).target == n;
+        assert(t.node_wf(w.0));
+        assert(!t.is_self_map(w.0, w.1));
+        assert(t.level(w.0) == t.level(n) + 1);  // > ROOT_LEVEL, contradicting the bound
+        assert(false);
+    }
+}
+
 /// `tree_wf` (+ root) transfer for unlink, in its own small context. By injectivity
 /// `(parent, idx)` was `child`'s only parent and an empty `child` is nobody's
 /// parent, so the surviving interior entries are an injective, fully-connected
@@ -1398,6 +1467,7 @@ pub proof fn lemma_unlink_tree_wf<V: PtPage>(
         t0.node(child).empty(),
         t1.store_wf(),
         t1.root() == t0.root(),
+        t1.sub_idx() == t0.sub_idx(),
         forall|c: PFN| #[trigger] t1.contains(c) <==> (c != child && t0.contains(c)),
         t1.node(parent) == t0.node(parent).update(idx, entry_absent()),
         forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
@@ -1405,19 +1475,23 @@ pub proof fn lemma_unlink_tree_wf<V: PtPage>(
     ensures
         t1.tree_wf(),
         t1.contains(t1.root()),
-        t1.level(t1.root()) == ROOT_LEVEL,
+        t1.level(t1.root()) == t1.root_level(),
 {
     broadcast use lemma_node_struct_wf, lemma_node_level_bound;
 
     let r = t0.root();
+    assert(t1.root_level() == t0.root_level() && t1.root_base() == t0.root_base());
     assert(t0.node_wf(parent));
     assert(t0.contains(child));
     assert(child != parent);
-    // `child` is not the root: only the self-map targets the root (injectivity),
-    // and (parent, idx) is not the self-map.
+    // `child` is not the (sub)root: the only edge that can target the root is the
+    // full table's self-map, and (parent, idx) is not it.
     assert(child != r) by {
         if child == r {
-            assert(t0.interior_at(r, IDX_SELFMAP) && t0.entry(r, IDX_SELFMAP).target == r);
+            lemma_root_incoming_is_self_map::<V>(t0, parent, idx);
+            // is_self_map(parent, idx): sub_idx None, level(parent)==ROOT_LEVEL, idx==SELFMAP.
+            assert(idx == IDX_SELFMAP && t0.level(parent) == t0.root_level());
+            assert(parent == r);  // root-unique then forces parent == r
         }
     }
     assert(t0.node(parent).e.dom().contains(idx));
@@ -1436,17 +1510,25 @@ pub proof fn lemma_unlink_tree_wf<V: PtPage>(
         assert(t1.contains(n));  // => n != child
         assert(n != parent || i != idx);  // else contradicts !t1.interior_at(parent, idx)
     }
-    // root stays live, at the top level.
+    // root stays live, at its level.
     assert(t1.contains(r));
-    assert(t1.level(r) == ROOT_LEVEL);
+    assert(t1.level(r) == t1.root_level());
 
     // --- tree_wf, clause by clause -----------------------------------
     assert forall|n: PFN| #![trigger t1.contains(n)]
-        t1.contains(n) && t1.level(n) == ROOT_LEVEL implies n == r by {
+        t1.contains(n) && t1.level(n) == t1.root_level() implies n == r by {
         assert(t0.contains(n));
     }
-    assert(t1.interior_at(r, IDX_SELFMAP));
-    assert(t1.entry(r, IDX_SELFMAP) == t0.entry(r, IDX_SELFMAP));
+    // the self-map (full table only) survives: it is interior in t0 (so != the
+    // cleared (parent, idx) slot, since the requires excludes the self-map).
+    assert(t1.self_map_inv()) by {
+        if t1.sub_idx() is None {
+            assert(t0.interior_at(r, IDX_SELFMAP) && t0.entry(r, IDX_SELFMAP).target == r);
+            assert(!(parent == r && idx == IDX_SELFMAP));
+            assert(t1.interior_at(r, IDX_SELFMAP));
+            assert(t1.entry(r, IDX_SELFMAP) == t0.entry(r, IDX_SELFMAP));
+        }
+    }
     // injectivity: t1's interior entries are a subset of t0's (unchanged), so inherit it.
     assert forall|n1: PFN, i1: nat, n2: PFN, i2: nat|
         (#[trigger] t1.interior_at(n1, i1) && #[trigger] t1.interior_at(n2, i2) && t1.entry(
@@ -1456,9 +1538,9 @@ pub proof fn lemma_unlink_tree_wf<V: PtPage>(
         assert(t0.interior_at(n1, i1) && t1.entry(n1, i1) == t0.entry(n1, i1));
         assert(t0.interior_at(n2, i2) && t1.entry(n2, i2) == t0.entry(n2, i2));
     }
-    // connectivity: each surviving node keeps its (unchanged) t0 parent.
+    // connectivity: each surviving node (!= root) keeps its (unchanged) t0 parent.
     assert forall|c: PFN| #![trigger t1.contains(c)]
-        t1.contains(c) implies exists|n: PFN, i: nat|
+        (t1.contains(c) && c != r) implies exists|n: PFN, i: nat|
         #[trigger] t1.interior_at(n, i) && t1.entry(n, i).target == c by {
         assert(t0.contains(c) && c != child);
         let w = choose|n: PFN, i: nat|
@@ -1541,6 +1623,7 @@ pub proof fn lemma_unlink_free_preserves_tree_inv<V: PtPage>(
         t0.node(child).empty(),
         t1.store_wf(),
         t1.root() == t0.root(),
+        t1.sub_idx() == t0.sub_idx(),
         forall|c: PFN| #[trigger] t1.contains(c) <==> (c != child && t0.contains(c)),
         t1.node(parent) == t0.node(parent).update(idx, entry_absent()),
         forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
@@ -1619,7 +1702,7 @@ pub proof fn lemma_unlink_consistent<V: PtPage>(
         t0.store_wf(),
         t0.xlate_base_consistent(),
         t0.contains(t0.root()),
-        t0.xlate_base(t0.root()) == 0,
+        t1.sub_idx() == t0.sub_idx(),
         t0.root() != child,
         t0.contains(parent),
         idx < ENTRIES,
@@ -1645,7 +1728,9 @@ pub proof fn lemma_unlink_consistent<V: PtPage>(
             assert(t1.node(parent).e[i] == t0.node(parent).e.insert(idx, entry_absent())[i]);
         }
     }
-    assert(t1.xlate_base(t1.root()) == 0);
+    assert(t1.root_base() == t0.root_base());
+    assert(t0.xlate_base(t0.root()) == t0.root_base());  // t0.xlate_base_consistent
+    assert(t1.xlate_base(t1.root()) == t1.root_base());
     assert forall|p: PFN, i: nat| (#[trigger] t1.interior_at(p, i) && !t1.is_self_map(p, i)) implies
         t1.xlate_base(t1.entry(p, i).target) == t1.entry_vpn_base(p, i) by {
         assert(t1.contains(p));  // p != child
@@ -1757,6 +1842,7 @@ pub proof fn lemma_unlink_child_preserves_mapping_wf<V: PtPage>(
         !(parent == t0.root() && idx == IDX_SELFMAP),
         t0.node(child).empty(),
         t1.root() == t0.root(),
+        t1.sub_idx() == t0.sub_idx(),
         forall|c: PFN| #[trigger] t1.contains(c) <==> (c != child && t0.contains(c)),
         t1.node(parent) == t0.node(parent).update(idx, entry_absent()),
         forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
@@ -1773,10 +1859,9 @@ pub proof fn lemma_unlink_child_preserves_mapping_wf<V: PtPage>(
     assert(t0.contains(t0.root()));
     assert(t0.root() != child) by {
         if child == t0.root() {
-            assert(t0.interior_at(t0.root(), IDX_SELFMAP) && t0.entry(
-                t0.root(),
-                IDX_SELFMAP,
-            ).target == t0.root());
+            lemma_root_incoming_is_self_map::<V>(t0, parent, idx);
+            assert(idx == IDX_SELFMAP && t0.level(parent) == t0.root_level());
+            assert(parent == t0.root());  // root-unique
         }
     }
     assert(t0.node(parent).e.dom().contains(idx));
@@ -1815,6 +1900,7 @@ pub proof fn lemma_va_map_irrelevant<V: PtPage>(t: PageTablePerms<V>, t2: PageTa
         t.xlate_wf(),
         t2.pages() == t.pages(),
         t2.root() == t.root(),
+        t2.sub_idx() == t.sub_idx(),
         forall|n: PFN| #[trigger] t2.xlate_base(n) == t.xlate_base(n),
     ensures
         t2.wf(),
@@ -1822,6 +1908,7 @@ pub proof fn lemma_va_map_irrelevant<V: PtPage>(t: PageTablePerms<V>, t2: PageTa
 {
     broadcast use lemma_node_struct_wf;
 
+    assert(t2.root_level() == t.root_level() && t2.root_base() == t.root_base());
     assert forall|p: PFN| #[trigger] t2.contains(p) == t.contains(p) by {}
     assert forall|p: PFN| #[trigger] t2.level(p) == t.level(p) by {}
     assert forall|p: PFN| #[trigger] t2.node(p) == t.node(p) by {}
@@ -1845,13 +1932,17 @@ pub proof fn lemma_va_map_irrelevant<V: PtPage>(t: PageTablePerms<V>, t2: PageTa
         }
         assert(t2.tree_wf()) by {
             assert forall|n: PFN| #![trigger t2.contains(n)]
-                t2.contains(n) && t2.level(n) == ROOT_LEVEL implies n == t2.root() by {
+                t2.contains(n) && t2.level(n) == t2.root_level() implies n == t2.root() by {
                 assert(t.contains(n));
             }
-            assert(t2.interior_at(t2.root(), IDX_SELFMAP) && t2.entry(
-                t2.root(),
-                IDX_SELFMAP,
-            ).target == t2.root());
+            assert(t2.self_map_inv()) by {
+                if t2.sub_idx() is None {
+                    assert(t.interior_at(t.root(), IDX_SELFMAP) && t.entry(
+                        t.root(),
+                        IDX_SELFMAP,
+                    ).target == t.root());
+                }
+            }
             assert forall|n1: PFN, i1: nat, n2: PFN, i2: nat|
                 (#[trigger] t2.interior_at(n1, i1) && #[trigger] t2.interior_at(n2, i2) && t2.entry(
                     n1,
@@ -1860,7 +1951,7 @@ pub proof fn lemma_va_map_irrelevant<V: PtPage>(t: PageTablePerms<V>, t2: PageTa
                 assert(t.interior_at(n1, i1) && t.interior_at(n2, i2));
             }
             assert forall|c: PFN| #![trigger t2.contains(c)]
-                t2.contains(c) implies exists|n: PFN, i: nat|
+                (t2.contains(c) && c != t2.root()) implies exists|n: PFN, i: nat|
                 #[trigger] t2.interior_at(n, i) && t2.entry(n, i).target == c by {
                 assert(t.contains(c));
                 let w = choose|n: PFN, i: nat|
@@ -1884,7 +1975,8 @@ pub proof fn lemma_va_map_irrelevant<V: PtPage>(t: PageTablePerms<V>, t2: PageTa
         }
     }
     assert(t2.xlate_base_consistent()) by {
-        assert(t2.xlate_base(t2.root()) == 0);
+        assert(t.xlate_base(t.root()) == t.root_base());  // t.xlate_wf
+        assert(t2.xlate_base(t2.root()) == t2.root_base());
         assert forall|p: PFN, i: nat| (#[trigger] t2.interior_at(p, i) && !t2.is_self_map(p, i))
             implies t2.xlate_base(t2.entry(p, i).target) == t2.entry_vpn_base(p, i) by {
             assert(t.interior_at(p, i) && !t.is_self_map(p, i));

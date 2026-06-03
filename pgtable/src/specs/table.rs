@@ -148,11 +148,48 @@ pub tracked struct PageTablePerms<V: PtPage> {
     tracked pages_: Map<PFN, PTNodePerm<V>>,
     ghost xlate_base_: Map<PFN, VPage>,
     ghost va_map_: Map<VPage, VMap>,
+    /// `None` = a full table (level-3 root, self-map). `Some(i)` = a subtree view
+    /// checked out from a full table's top-level entry `i` (root is the level-2
+    /// child, no self-map). See `split`/`join`.
+    ghost sub_idx_: Option<nat>,
 }
 
 impl<V: PtPage> PageTablePerms<V> {
     pub closed spec fn root(self) -> PFN {
         self.root_
+    }
+
+    /// `None` for a full table, `Some(i)` for the subtree under top-level entry `i`.
+    pub closed spec fn sub_idx(self) -> Option<nat> {
+        self.sub_idx_
+    }
+
+    /// The paging level of this (sub)table's root: 3 for a full table, 2 for a
+    /// subtree.
+    pub open spec fn root_level(self) -> nat {
+        if self.sub_idx() is None {
+            ROOT_LEVEL
+        } else {
+            (ROOT_LEVEL - 1) as nat
+        }
+    }
+
+    /// The base virtual page of this (sub)table's root: 0 for a full table, the base
+    /// of top-level entry `i` for the subtree under `i`.
+    pub open spec fn root_base(self) -> VPage {
+        if self.sub_idx() is None {
+            0
+        } else {
+            (self.sub_idx()->Some_0 * span(ROOT_LEVEL)) as nat
+        }
+    }
+
+    /// The recursive self-map back-edge, present only in a full table.
+    pub open spec fn self_map_inv(self) -> bool {
+        self.sub_idx() is None ==> {
+            &&& self.interior_at(self.root(), IDX_SELFMAP)
+            &&& self.entry(self.root(), IDX_SELFMAP).target == self.root()
+        }
     }
 
     pub closed spec fn pages(self) -> Map<PFN, PTNodePerm<V>> {
@@ -384,9 +421,10 @@ impl<V: PtPage> PageTablePerms<V> {
     /// base to the entry's base. `reflects_walk` is *derived* from this + `tree_inv`
     /// by `lemma_reflects_walk`, so the structural ops only maintain this local fact.
     pub open spec fn xlate_base_consistent(self) -> bool {
-        &&& self.xlate_base(self.root()) == 0
+        &&& self.xlate_base(self.root()) == self.root_base()
         // The self-map `root[IDX_SELFMAP] -> root` is a back-edge, not a normal
-        // parent link, so it is exempt (its target's base is 0, not the entry base).
+        // parent link, so it is exempt (its target's base is the root base, not the
+        // entry base).
         &&& forall|p: PFN, idx: nat|
             (#[trigger] self.interior_at(p, idx) && !self.is_self_map(p, idx))
                 ==> self.xlate_base(self.entry(p, idx).target) == self.entry_vpn_base(p, idx)
@@ -480,8 +518,10 @@ impl<V: PtPage> PageTablePerms<V> {
 
     // --- structural well-formedness ----------------------------------
     /// The recursive self-map slot: the root's entry that points back to the root.
+    /// Present only in a full table - a subtree (`sub_idx` Some) has no self-map and
+    /// no node at `ROOT_LEVEL`, so this is unconditionally false there.
     pub open spec fn is_self_map(self, n: PFN, idx: nat) -> bool {
-        self.level(n) == ROOT_LEVEL && idx == IDX_SELFMAP
+        self.sub_idx() is None && self.level(n) == ROOT_LEVEL && idx == IDX_SELFMAP
     }
 
     /// Node `n`'s present entries resolve correctly: leaves are aligned to their
@@ -524,16 +564,17 @@ impl<V: PtPage> PageTablePerms<V> {
     ///     parent - the root's being its self-map.
     pub open spec fn tree_wf(self) -> bool {
         &&& forall|n: PFN| #[trigger]
-            self.contains(n) ==> (self.level(n) == ROOT_LEVEL ==> n == self.root())
-        &&& self.interior_at(self.root(), IDX_SELFMAP)
-        &&& self.entry(self.root(), IDX_SELFMAP).target == self.root()
+            self.contains(n) ==> (self.level(n) == self.root_level() ==> n == self.root())
+        &&& self.self_map_inv()
         &&& forall|n1: PFN, i1: nat, n2: PFN, i2: nat|
             #![trigger self.interior_at(n1, i1), self.interior_at(n2, i2)]
             (self.interior_at(n1, i1) && self.interior_at(n2, i2) && self.entry(n1, i1).target
                 == self.entry(n2, i2).target) ==> (n1 == n2 && i1 == i2)
+        // every live node EXCEPT the (sub)root has a parent (the full root's parent
+        // is its self-map, asserted separately; the subtree root has none).
         &&& forall|c: PFN|
             #![trigger self.contains(c)]
-            self.contains(c) ==> exists|n: PFN, idx: nat|
+            (self.contains(c) && c != self.root()) ==> exists|n: PFN, idx: nat|
                 #![trigger self.interior_at(n, idx)]
                 self.interior_at(n, idx) && self.entry(n, idx).target == c
     }
@@ -559,7 +600,7 @@ impl<V: PtPage> PageTablePerms<V> {
     /// of this yet; it is left simple and will be reworked later.)
     pub open spec fn tree_inv(self) -> bool {
         &&& self.contains(self.root())
-        &&& self.level(self.root()) == ROOT_LEVEL
+        &&& self.level(self.root()) == self.root_level()
         &&& self.links_wf()
         &&& self.tree_wf()
         &&& self.ad_pinned()
@@ -863,6 +904,7 @@ pub proof fn lemma_singleton_table<V: PtPage>(rp: PFN, tracked root_perm: PTNode
         pages_: m,
         xlate_base_: Map::empty().insert(rp, 0),
         va_map_: Map::empty(),
+        sub_idx_: None,
     };
 
     assert(perms.contains(rp));
