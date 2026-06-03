@@ -25,6 +25,7 @@ use crate::specs::node::{
 };
 use crate::specs::perm::{PA, VA, pfn_of_pa};
 use crate::specs::table_proof::*;
+use crate::specs::table_split::{is_split_full, is_split_sub, lemma_split_full, lemma_split_sub};
 use crate::stubs::SvsmError;
 use vstd::prelude::*;
 
@@ -1240,6 +1241,141 @@ pub fn unmap<V: PtPage>(
         assert(t1.mapping_wf());
         assert(!t1.va_map().dom().contains(b));
     }
+}
+
+/// Check OUT the subtree under top-level entry `idx` as a standalone subtree view:
+/// clear `root[idx]`, move the subtree's node permissions (and its `va_map` slice)
+/// out of the full table, and return them as a `sub_idx = Some(idx)` table the caller
+/// can `map`/`unmap` on without holding the whole-table permission. `join` checks it
+/// back in. The subtree must already exist (`root[idx]` a present interior); the
+/// detached subtree keeps absolute vpns (same `xlate_base`).
+pub fn split<V: PtPage>(
+    root_va: VA,
+    idx: usize,
+    Tracked(perms): Tracked<&mut PageTablePerms<V>>,
+) -> (sub: Tracked<PageTablePerms<V>>)
+    requires
+        old(perms).wf(),
+        old(perms).mapping_wf(),
+        old(perms).sub_idx() is None,
+        root_va == old(perms).node_va(old(perms).root()),
+        idx < 512,
+        idx as nat != IDX_SELFMAP,
+        old(perms).interior_at(old(perms).root(), idx as nat),
+    ensures
+        final(perms).wf(),
+        final(perms).mapping_wf(),
+        final(perms).root() == old(perms).root(),
+        final(perms).sub_idx() is None,
+        sub@.wf(),
+        sub@.mapping_wf(),
+        sub@.sub_idx() == Some(idx as nat),
+        sub@.root() == old(perms).entry(old(perms).root(), idx as nat).target,
+        is_split_full(*old(perms), *final(perms), idx as nat),
+        is_split_sub(*old(perms), sub@, idx as nat),
+{
+    broadcast use lemma_node_struct_wf, lemma_node_pfn;
+
+    let ghost t0 = *perms;
+    let ghost r = t0.root();
+    let ghost c = t0.entry(r, idx as nat).target;
+    let ghost sset = t0.subtree_pfns(idx as nat);
+    let ghost win = Set::new(|b: VPage| PageTablePerms::<V>::vpn_in_top(idx as nat, b));
+
+    // 1. clear root[idx] (the subtree stays in the store for now).
+    let absent = V::make_absent();
+    let tracked root_perm = perms.pages_.tracked_borrow_mut(r);
+    node_set_entry::<V>(root_va, Tracked(root_perm), idx, absent);
+    let ghost tmid = *perms;
+
+    // 2. carve the subtree's node permissions out of the store.
+    let tracked sub_perms;
+    proof {
+        assert(sset.subset_of(perms.pages_.dom())) by {
+            assert forall|n: PFN| sset.contains(n) implies perms.pages_.dom().contains(n) by {
+                assert(t0.in_subtree(idx as nat, n));  // => t0.contains(n); dom unchanged by clear
+            }
+        }
+        let tracked sub_pages = perms.pages_.tracked_remove_keys(sset);
+        // The translation bases are read only at live nodes, so the two halves can
+        // share the (immutable) `xlate_base_` map - membership (`contains`) is what
+        // distinguishes them. The `va_map` IS partitioned by entry `idx`'s window.
+        let sub_vm = perms.va_map_.restrict(win);
+        perms.va_map_ = perms.va_map_.restrict(win.complement());
+        sub_perms = PageTablePerms {
+            root_: c,
+            pages_: sub_pages,
+            xlate_base_: perms.xlate_base_,
+            va_map_: sub_vm,
+            sub_idx_: Some(idx as nat),
+        };
+    }
+
+    // 3. discharge the two partition relations and conclude validity.
+    proof {
+        let tf = *perms;
+        let ts = sub_perms;
+
+        // --- is_split_full(t0, tf, idx) ---
+        assert(tf.root() == r && tf.sub_idx() is None);
+        assert forall|n: PFN| #[trigger] tf.contains(n) <==> (t0.contains(n) && !t0.in_subtree(
+            idx as nat,
+            n,
+        )) by {
+            assert(tmid.contains(n) == t0.contains(n));  // clear keeps the domain
+            assert(sset.contains(n) == t0.in_subtree(idx as nat, n));
+        }
+        assert(tf.node(r) == t0.node(r).update(idx as nat, entry_absent()));
+        assert forall|n: PFN| #[trigger] tf.contains(n) implies (n == r || tf.node(n) == t0.node(n))
+            by {
+            if n != r {
+                assert(tmid.node(n) == t0.node(n));  // only r changed
+            }
+        }
+        assert forall|n: PFN| #[trigger] tf.contains(n) implies tf.level(n) == t0.level(n) by {}
+        assert forall|n: PFN| #[trigger] tf.contains(n) implies tf.xlate_base(n) == t0.xlate_base(n)
+            by {}
+        assert forall|b: VPage| #[trigger] tf.va_map().dom().contains(b) <==> (t0.va_map().dom().contains(
+            b,
+        ) && !PageTablePerms::<V>::vpn_in_top(idx as nat, b)) by {
+            assert(win.complement().contains(b) == !PageTablePerms::<V>::vpn_in_top(idx as nat, b));
+        }
+        assert forall|b: VPage| #[trigger] tf.va_map().dom().contains(b) implies tf.va_map()[b]
+            == t0.va_map()[b] by {}
+        assert(is_split_full(t0, tf, idx as nat));
+
+        // store_wf of the remainder (root stays well-formed and PFN-keyed; rest untouched).
+        assert forall|p: PFN| tf.contains(p) implies (#[trigger] tf.pages()[p].wf()
+            && tf.pages()[p].pfn() == p) by {
+            assert(t0.contains(p));
+            if p != r {
+                assert(tf.pages()[p] == t0.pages()[p]);
+            }
+        }
+        lemma_split_full::<V>(t0, tf, idx as nat);
+
+        // --- is_split_sub(t0, ts, idx) ---
+        assert(ts.root() == c && ts.sub_idx() == Some(idx as nat));
+        assert forall|n: PFN| #[trigger] ts.contains(n) <==> t0.in_subtree(idx as nat, n) by {
+            assert(sset.contains(n) == t0.in_subtree(idx as nat, n));
+        }
+        assert forall|n: PFN| #[trigger] ts.contains(n) implies ts.pages()[n] == t0.pages()[n] by {
+            assert(t0.in_subtree(idx as nat, n) && n != r);  // subtree excludes the root
+            assert(tmid.pages()[n] == t0.pages()[n]);
+        }
+        assert forall|n: PFN| #[trigger] ts.contains(n) implies ts.xlate_base(n) == t0.xlate_base(n)
+            by {}
+        assert forall|b: VPage| #[trigger] ts.va_map().dom().contains(b) <==> (t0.va_map().dom().contains(
+            b,
+        ) && PageTablePerms::<V>::vpn_in_top(idx as nat, b)) by {
+            assert(win.contains(b) == PageTablePerms::<V>::vpn_in_top(idx as nat, b));
+        }
+        assert forall|b: VPage| #[trigger] ts.va_map().dom().contains(b) implies ts.va_map()[b]
+            == t0.va_map()[b] by {}
+        assert(is_split_sub(t0, ts, idx as nat));
+        lemma_split_sub::<V>(t0, ts, idx as nat);
+    }
+    Tracked(sub_perms)
 }
 
 // =====================================================================
