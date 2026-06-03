@@ -430,6 +430,30 @@ impl<V: PtPage> PageTablePerms<V> {
                 ==> self.xlate_base(self.entry(p, idx).target) == self.entry_vpn_base(p, idx)
     }
 
+    // --- subtree membership (split/join) -----------------------------
+    /// Does node `n` belong to the subtree under top-level entry `i` of a full
+    /// table? A live non-root node whose translation base lies in entry `i`'s
+    /// `span(ROOT_LEVEL)`-page window. By `xlate_base_consistent` this is exactly the
+    /// set reachable through `root[i]` - the slice `split`/`join` carve out and back.
+    pub open spec fn in_subtree(self, i: nat, n: PFN) -> bool {
+        &&& self.contains(n)
+        &&& n != self.root()
+        &&& i * span(ROOT_LEVEL) <= self.xlate_base(n)
+        &&& self.xlate_base(n) < (i + 1) * span(ROOT_LEVEL)
+    }
+
+    /// The PFNs of the subtree under top-level entry `i` (the ghost key set the exec
+    /// `split` moves out of / `join` moves back into the tracked permission map).
+    pub open spec fn subtree_pfns(self, i: nat) -> Set<PFN> {
+        Set::new(|n: PFN| self.in_subtree(i, n))
+    }
+
+    /// Is vpn `b` inside top-level entry `i`'s window? (The `va_map` keys that move
+    /// with the subtree.)
+    pub open spec fn vpn_in_top(i: nat, b: VPage) -> bool {
+        i * span(ROOT_LEVEL) <= b < (i + 1) * span(ROOT_LEVEL)
+    }
+
     // --- the user-mapping coupling -----------------------------------
     /// Does mapping `m` based at vpn `b` cover `vpn` (i.e. `vpn` in its range)?
     pub open spec fn vmap_covers(b: VPage, m: VMap, vpn: VPage) -> bool {

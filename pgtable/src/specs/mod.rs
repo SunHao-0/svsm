@@ -22,3 +22,4 @@ pub mod node;
 pub mod perm;
 pub mod table;
 pub mod table_proof;
+pub mod table_split;
