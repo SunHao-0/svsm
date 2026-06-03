@@ -88,25 +88,39 @@ impl PA {
     }
 }
 
-/// Physical frame number of a physical address (`paddr >> 12`).
-pub open spec fn pfn_of(pa: PA) -> nat {
-    (pa.addr() as nat) / PAGE_SIZE
-}
-
-/// The PFN of a physical address as an executable `usize`. Trusted: a bit shift,
-/// equal to the spec `pfn_of`.
-#[verifier::external_body]
-pub fn pfn_of_pa(pa: PA) -> (pfn: usize)
-    ensures
-        pfn as nat == pfn_of(pa),
-{
-    pa.0 >> 12
-}
-
 /// `pa` is 4K-aligned.
 pub open spec fn pa_page_aligned(pa: PA) -> bool {
     (pa.addr() as nat) % PAGE_SIZE == 0
 }
+
+/// Physical frame number of a physical address (`paddr >> 12`).
+pub open spec fn pfn_of(pa: PA) -> nat
+    recommends
+        pa_page_aligned(pa),
+{
+    (pa.addr() as nat) / PAGE_SIZE
+}
+
+/// The PFN of a physical address as an executable `usize`: a verified bit shift,
+/// proven equal to the spec `pfn_of` (`>> 12` is `/ 4096 == / PAGE_SIZE`).
+pub fn pfn_of_pa(pa: PA) -> (pfn: usize)
+    requires
+        pa_page_aligned(pa),
+    ensures
+        pfn as nat == pfn_of(pa),
+{
+    let pfn = pa.0 >> 12;
+    proof {
+        let x = pa.0;
+        assert(x >> 12 == x / 4096) by (bit_vector);
+        assert((x / 4096) as nat == (x as nat) / (PAGE_SIZE as nat)) by (nonlinear_arith)
+            requires
+                PAGE_SIZE == 4096,
+        ;
+    }
+    pfn
+}
+
 
 /// A virtual address. For a page permission this is the *direct-map* virtual
 /// address through which the page is accessed.
@@ -126,59 +140,6 @@ impl VA {
 pub uninterp spec fn direct_map(pa: PA) -> VA;
 
 pub uninterp spec fn reverse_direct_map(va: VA) -> PA;
-
-// =====================================================================
-// Layer 0: FramePerm - physical-frame region (contents not tracked)
-// =====================================================================
-//
-// The page-table-page proofs do not need this layer yet, so it is kept basic: it
-// provides the region algebra (`split`/`join`) and the bridges to/from the typed
-// `PagePerm<V>`. Minting a fresh raw region (e.g. a contiguous 2M frame) is left
-// as a future trusted entry point.
-/// Ownership of a set of physical 4K frames, without tracking their contents.
-#[verifier::external_body]
-pub tracked struct FramePerm {}
-
-impl FramePerm {
-    /// The set of 4K physical frame numbers this permission owns.
-    pub uninterp spec fn frames(self) -> Set<nat>;
-
-    /// This permission owns exactly the `npages` 4K frames starting at `base`.
-    pub open spec fn is_frame(self, base: nat, npages: nat) -> bool {
-        self.frames() =~= Set::new(|p: nat| base <= p < base + npages)
-    }
-
-    /// Carve out the sub-region `sub`, splitting into (owned `sub`, owned rest).
-    /// The two results partition the original, so no frame is ever duplicated.
-    pub axiom fn split(tracked self, sub: Set<nat>) -> (tracked res: (FramePerm, FramePerm))
-        requires
-            sub.subset_of(self.frames()),
-        ensures
-            res.0.frames() == sub,
-            res.1.frames() == self.frames().difference(sub),
-    ;
-
-    /// Merge two regions back into one (the union of their frames).
-    pub axiom fn join(tracked self, tracked other: FramePerm) -> (tracked res: FramePerm)
-        ensures
-            res.frames() == self.frames().union(other.frames()),
-    ;
-
-    /// Reinterpret a single owned 4K frame as an *uninitialized* typed page
-    /// permission. `va` must be the direct-map address of the frame.
-    pub axiom fn into_typed<V>(tracked self, va: VA, pa: PA) -> (tracked perm: PagePerm<V>)
-        requires
-            self.is_frame(pfn_of(pa), 1),
-            pa_page_aligned(pa),
-            va == direct_map(pa),
-            reverse_direct_map(va) == pa,
-        ensures
-            perm.wf(),
-            perm.va() == va,
-            perm.pa() == pa,
-            perm.is_uninit(),
-    ;
-}
 
 // =====================================================================
 // Layer 1: PagePerm<V> - typed, PFN-tagged 4K page permission (the core)
@@ -240,18 +201,12 @@ impl<V> PagePerm<V> {
     /// Address coherence: `va` is the direct map of the physical page, both
     /// directions agree, and the page is 4K-aligned. The *value* is intentionally
     /// unconstrained here (init/uninit and contents are tracked separately).
+    #[verifier::type_invariant]
     pub open spec fn wf(self) -> bool {
         &&& self.va() == direct_map(self.pa())
         &&& reverse_direct_map(self.va()) == self.pa()
         &&& pa_page_aligned(self.pa())
     }
-
-    /// Give up access and reclaim the underlying physical frame (contents
-    /// forgotten). Inverse of `FramePerm::into_typed`.
-    pub axiom fn into_frame(tracked self) -> (tracked frame: FramePerm)
-        ensures
-            frame.is_frame(self.pfn(), 1),
-    ;
 }
 
 // --- trusted access primitives: the entire `unsafe` surface of Layer 1 ---

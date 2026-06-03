@@ -384,9 +384,11 @@ impl<V: PtPage> PageTablePerms<V> {
     /// by `lemma_reflects_walk`, so the structural ops only maintain this local fact.
     pub open spec fn xlate_base_consistent(self) -> bool {
         &&& self.xlate_base(self.root()) == 0
-        &&& forall|p: PFN, idx: nat| #[trigger]
-            self.interior_at(p, idx) ==> self.xlate_base(self.entry(p, idx).target)
-                == self.entry_vpn_base(p, idx)
+        // The self-map `root[IDX_SELFMAP] -> root` is a back-edge, not a normal
+        // parent link, so it is exempt (its target's base is 0, not the entry base).
+        &&& forall|p: PFN, idx: nat|
+            (#[trigger] self.interior_at(p, idx) && !self.is_self_map(p, idx))
+                ==> self.xlate_base(self.entry(p, idx).target) == self.entry_vpn_base(p, idx)
     }
 
     // --- the user-mapping coupling -----------------------------------
@@ -406,26 +408,35 @@ impl<V: PtPage> PageTablePerms<V> {
         }
     }
 
+    /// `(n, idx)` is the leaf that records the mapping based at vpn `b` of size `m`:
+    /// a present user-region leaf at the right level, based exactly at `b`, matching
+    /// the record. Stated over `node_covers`/`leaf_at` (both structural / per-slot),
+    /// so EVERY op preserves it locally - `node_on_path` and the walk are not here.
+    pub open spec fn records_leaf(self, b: VPage, m: VMap, n: PFN, idx: nat) -> bool {
+        &&& self.contains(n)
+        &&& self.level(n) == level_of_size(m.size)
+        &&& idx == pt_index(b, level_of_size(m.size))
+        &&& self.node_covers(n, b)
+        &&& self.leaf_at(n, idx)
+        &&& self.entry_vpn_base(n, idx) == b
+        &&& self.vmap_of_leaf(n, idx) == m
+    }
+
     /// The user-mapping invariant, stated LEAF-LOCALLY so a single leaf write moves
     /// exactly one `va_map` key (no global walk reasoning per op). The walk-level
     /// consistency you actually want - `walk(vpn)` agrees with `va_map` - is the
     /// THEOREM `lemma_mapping_walk_coupling`, derived from this + the bridge lemmas.
     /// Not yet part of `wf`.
     pub open spec fn mapping_inv(self) -> bool {
-        // (Q) COMPLETE: every recorded mapping is a present user-region leaf sitting
-        // at the node the path names for its base/size - so the walk realizes it.
+        // (Q) COMPLETE: every recorded mapping is a present user-region leaf at the
+        // node covering its base, based exactly there - so the walk realizes it.
         &&& forall|b: VPage| #[trigger]
             self.va_map().dom().contains(b) ==> {
                 let m = self.va_map()[b];
-                let l = level_of_size(m.size);
-                let n = self.node_on_path(b, l)->Some_0;
                 &&& in_user_region(b)
                 &&& b % m.size.pages() == 0
                 &&& m.frame % m.size.pages() == 0
-                &&& self.node_on_path(b, l) is Some
-                &&& self.leaf_at(n, pt_index(b, l))
-                &&& self.entry_vpn_base(n, pt_index(b, l)) == b
-                &&& self.vmap_of_leaf(n, pt_index(b, l)) == m
+                &&& exists|n: PFN| self.records_leaf(b, m, n, pt_index(b, level_of_size(m.size)))
             }
         // (P) SOUND: every user-region leaf is recorded at its base - so the walk
         // never resolves a user mapping we did not record.
@@ -446,6 +457,24 @@ impl<V: PtPage> PageTablePerms<V> {
             (b1 != b2 && #[trigger] self.va_map().dom().contains(b1)
                 && #[trigger] self.va_map().dom().contains(b2)) ==> (b1 + self.va_map()[b1].size.pages()
                 <= b2 || b2 + self.va_map()[b2].size.pages() <= b1)
+    }
+
+    /// The STRUCTURAL backing of the mapping coupling: permissive interiors and the
+    /// local `xlate_base` facts. Preserved by ANY op that does not create a
+    /// restrictive interior or move a node's base - including a plain leaf write -
+    /// so `table_set_entry` keeps it while `mapping_inv` is re-established by
+    /// `map`/`unmap`.
+    pub open spec fn xlate_wf(self) -> bool {
+        &&& self.interiors_permissive()
+        &&& self.xlate_base_consistent()
+        &&& self.xlate_base_aligned()
+    }
+
+    /// The full mapping invariant: the structural backing plus the leaf-local
+    /// coupling. `wf` already gives the tree; this is the user-mapping layer on top.
+    pub open spec fn mapping_wf(self) -> bool {
+        &&& self.xlate_wf()
+        &&& self.mapping_inv()
     }
 
     // --- structural well-formedness ----------------------------------
@@ -863,11 +892,12 @@ pub proof fn lemma_mapping_walk_coupling<V: PtPage>(t: PageTablePerms<V>, b: VPa
 
     let m = t.va_map()[b];
     let l = level_of_size(m.size);
-    let n = t.node_on_path(b, l)->Some_0;  // mapping_inv (Q): the leaf node
     let idx = pt_index(b, l);
-    // mapping_inv (Q): the recorded mapping is a leaf at (n, idx), based at b.
-    assert(t.node_on_path(b, l) is Some && t.leaf_at(n, idx) && t.vmap_of_leaf(n, idx) == m
-        && t.entry_vpn_base(n, idx) == b);
+    // mapping_inv (Q): a leaf at some node n records this mapping; pick that witness.
+    let n = choose|n: PFN| t.records_leaf(b, m, n, idx);
+    assert(t.records_leaf(b, m, n, idx));
+    assert(t.contains(n) && t.level(n) == l && t.leaf_at(n, idx) && t.node_covers(n, b)
+        && t.vmap_of_leaf(n, idx) == m && t.entry_vpn_base(n, idx) == b);
     // The leaf sits at level l (leaves are at level <= 2, so size<->level round-trips).
     assert(t.node_wf(n));
     assert(t.level(n) <= 2);
@@ -1260,6 +1290,363 @@ pub proof fn lemma_link_child_preserves_tree_inv<V: PtPage>(
     }
 }
 
+/// `xlate_wf` half of the link-child mapping preservation, in its own small proof
+/// context (no `leaf_at`/`va_map` reasoning): the new interior is permissive, the
+/// new link is consistent (child's base == the entry's base), and the child's base
+/// is aligned. By freshness no existing interior targets `child`.
+#[verifier::rlimit(50)]
+pub proof fn lemma_link_child_xlate_wf<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+)
+    requires
+        t0.store_wf(),
+        t0.xlate_wf(),
+        t0.contains(t0.root()),
+        t0.level(parent) <= ROOT_LEVEL,
+        t0.contains(parent),
+        idx < ENTRIES,
+        t0.level(parent) >= 1,
+        !t0.node(parent).e[idx].present,
+        !(parent == t0.root() && idx == IDX_SELFMAP),
+        !t0.contains(child),
+        t0.xlate_base(t0.root()) == 0,
+        // freshness: no existing interior targets `child` (derived from tree_inv by
+        // the caller, passed here so this context stays free of the tree soup).
+        forall|n: PFN, i: nat| #[trigger] t0.interior_at(n, i) ==> t0.entry(n, i).target != child,
+        t1.root() == t0.root(),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c == child || t0.contains(c)),
+        t1.node(child).empty(),
+        t1.level(child) == t0.level(parent) - 1,
+        t1.node(parent) == t0.node(parent).update(idx, interior_entry(child)),
+        t1.level(parent) == t0.level(parent),
+        forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
+        t1.xlate_base(child) == t0.entry_vpn_base(parent, idx),
+        forall|m: PFN| m != child ==> #[trigger] t1.xlate_base(m) == t0.xlate_base(m),
+    ensures
+        t1.xlate_wf(),
+{
+    lemma_link_child_permissive::<V>(t0, t1, parent, idx, child);
+    lemma_link_child_consistent::<V>(t0, t1, parent, idx, child);
+    lemma_link_child_aligned::<V>(t0, t1, parent, idx, child);
+}
+
+/// `interiors_permissive` clause of the link-child preservation (own small context).
+#[verifier::rlimit(40)]
+pub proof fn lemma_link_child_permissive<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+)
+    requires
+        t0.store_wf(),
+        t0.interiors_permissive(),
+        t0.contains(parent),
+        idx < ENTRIES,
+        t0.level(parent) >= 1,
+        !t0.contains(child),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c == child || t0.contains(c)),
+        t1.node(child).empty(),
+        t1.node(parent) == t0.node(parent).update(idx, interior_entry(child)),
+        t1.level(parent) == t0.level(parent),
+        forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
+    ensures
+        t1.interiors_permissive(),
+{
+    broadcast use lemma_node_struct_wf;
+
+    let ei = interior_entry(child);
+    assert(t0.node(parent).e.dom().contains(idx));
+    assert forall|n: PFN, i: nat| (n != child && (n != parent || i != idx)) implies
+        #[trigger] t1.entry(n, i) == t0.entry(n, i) by {
+        if n == parent {
+            assert(t1.node(parent).e[i] == t0.node(parent).e.insert(idx, ei)[i]);
+        }
+    }
+    assert(t1.entry(parent, idx) == ei);
+    assert forall|n: PFN, i: nat| #[trigger] t1.interior_at(n, i) implies permissive(t1.entry(n, i))
+        by {
+        if !(n == parent && i == idx) {
+            assert(n != child);
+            assert(t1.entry(n, i) == t0.entry(n, i));
+            assert(t0.interior_at(n, i));
+        }
+    }
+}
+
+/// `xlate_base_consistent` clause of the link-child preservation (own small context).
+#[verifier::rlimit(40)]
+pub proof fn lemma_link_child_consistent<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+)
+    requires
+        t0.store_wf(),
+        t0.xlate_base_consistent(),
+        t0.contains(t0.root()),
+        t0.xlate_base(t0.root()) == 0,
+        t0.contains(parent),
+        idx < ENTRIES,
+        t0.level(parent) >= 1,
+        !(parent == t0.root() && idx == IDX_SELFMAP),
+        !t0.contains(child),
+        forall|n: PFN, i: nat| #[trigger] t0.interior_at(n, i) ==> t0.entry(n, i).target != child,
+        t1.root() == t0.root(),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c == child || t0.contains(c)),
+        t1.node(child).empty(),
+        t1.node(parent) == t0.node(parent).update(idx, interior_entry(child)),
+        t1.level(parent) == t0.level(parent),
+        forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
+        t1.xlate_base(child) == t0.entry_vpn_base(parent, idx),
+        forall|m: PFN| m != child ==> #[trigger] t1.xlate_base(m) == t0.xlate_base(m),
+    ensures
+        t1.xlate_base_consistent(),
+{
+    broadcast use lemma_node_struct_wf;
+
+    let ei = interior_entry(child);
+    assert(t0.node(parent).e.dom().contains(idx));
+    assert forall|n: PFN, i: nat| (n != child && (n != parent || i != idx)) implies
+        #[trigger] t1.entry(n, i) == t0.entry(n, i) by {
+        if n == parent {
+            assert(t1.node(parent).e[i] == t0.node(parent).e.insert(idx, ei)[i]);
+        }
+    }
+    assert(t1.entry(parent, idx) == ei);
+    assert(t0.root() != child);  // child is fresh, root is live
+    assert(t1.xlate_base(t1.root()) == 0);  // root != child, base unchanged
+    assert forall|p: PFN, i: nat| (#[trigger] t1.interior_at(p, i) && !t1.is_self_map(p, i)) implies
+        t1.xlate_base(t1.entry(p, i).target) == t1.entry_vpn_base(p, i) by {
+        if p == parent && i == idx {
+            assert(t1.entry(parent, idx).target == child);
+            assert(t1.entry_vpn_base(parent, idx) == t0.entry_vpn_base(parent, idx));
+        } else {
+            assert(p != child);
+            assert(t1.entry(p, i) == t0.entry(p, i));
+            assert(t0.interior_at(p, i) && !t0.is_self_map(p, i));
+            let tgt = t0.entry(p, i).target;
+            assert(tgt != child);  // freshness
+            assert(t1.xlate_base(tgt) == t0.xlate_base(tgt));
+            assert(t1.entry_vpn_base(p, i) == t0.entry_vpn_base(p, i));
+        }
+    }
+}
+
+/// Arithmetic, isolated so the nonlinear solver work stays out of the structural
+/// proofs: a base aligned to the parent stride `s2 = 512*s` plus `idx` child strides
+/// `s` is still aligned to `s`.
+pub proof fn lemma_base_aligned(a: nat, s: nat, s2: nat, idx: nat)
+    requires
+        s2 == 512 * s,
+        a % s2 == 0,
+        s > 0,
+    ensures
+        (a + idx * s) % s == 0,
+{
+    let ai = a as int;
+    let si = s as int;
+    // Step 1: a % s == 0, since a % (512*s) == 0 and s | (512*s).
+    vstd::arithmetic::div_mod::lemma_mod_mod(ai, si, 512);  // (ai % (si*512)) % si == ai % si
+    vstd::arithmetic::div_mod::lemma_mod_multiples_basic(0, si);  // 0 % si == 0
+    assert(si * 512 == s2 as int);
+    assert(ai % (si * 512) == 0);  // si*512 == s2, and a % s2 == 0
+    assert((ai % (si * 512)) % si == ai % si);  // lemma_mod_mod
+    assert(ai % si == 0);
+    // Step 2: adding idx whole strides of s does not change the residue.
+    vstd::arithmetic::div_mod::lemma_mod_multiples_vanish(idx as int, ai, si);  // (si*idx+ai)%si == ai%si
+    assert((ai + (idx as int) * si) == si * (idx as int) + ai);
+    assert((a + idx * s) as int == ai + (idx as int) * si);
+}
+
+/// `xlate_base_aligned` clause of the link-child preservation (own small context).
+#[verifier::rlimit(40)]
+pub proof fn lemma_link_child_aligned<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+)
+    requires
+        t0.xlate_base_aligned(),
+        t0.contains(parent),
+        idx < ENTRIES,
+        t0.level(parent) >= 1,
+        t0.level(parent) <= ROOT_LEVEL,
+        !t0.contains(child),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c == child || t0.contains(c)),
+        t1.level(child) == t0.level(parent) - 1,
+        t1.level(parent) == t0.level(parent),
+        forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
+        t1.xlate_base(child) == t0.entry_vpn_base(parent, idx),
+        forall|m: PFN| m != child ==> #[trigger] t1.xlate_base(m) == t0.xlate_base(m),
+    ensures
+        t1.xlate_base_aligned(),
+{
+    let lp = t0.level(parent);
+    lemma_span_pos(lp);
+    let s = span(lp);
+    let s2 = span((lp + 1) as nat);
+    let a = t0.xlate_base(parent);
+    assert(s2 == 512 * s);
+    assert(s > 0);
+    assert(t1.level(child) == (lp - 1) as nat);
+    assert((lp - 1 + 1) as nat == lp);
+    assert(t1.xlate_base(child) == a + idx * s);  // entry_vpn_base(parent, idx)
+    assert(a % s2 == 0);  // aligned t0
+    // The only nonlinear step is delegated, so this context stays linear.
+    lemma_base_aligned(a, s, s2, idx);
+    assert(t1.xlate_base(child) % span((t1.level(child) + 1) as nat) == 0);
+    assert forall|n: PFN| #[trigger] t1.contains(n) implies t1.xlate_base(n) % span(
+        (t1.level(n) + 1) as nat,
+    ) == 0 by {
+        if n != child {
+            assert(t0.contains(n));
+            assert(t1.xlate_base(n) == t0.xlate_base(n) && t1.level(n) == t0.level(n));
+        }
+    }
+}
+
+/// `mapping_inv` half of the link-child preservation, in its own small context (no
+/// `interior_at`/`tree_inv` reasoning): `child` is empty so `leaf_at` and every
+/// leaf's base are unchanged; thus the recorded witnesses and the leaf->record
+/// direction transfer, and `va_map` is untouched so the disjointness clauses hold.
+#[verifier::rlimit(50)]
+pub proof fn lemma_link_child_mapping_inv<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+)
+    requires
+        t0.store_wf(),
+        t0.mapping_inv(),
+        t0.contains(parent),
+        idx < ENTRIES,
+        t0.level(parent) >= 1,
+        !t0.node(parent).e[idx].present,
+        !t0.contains(child),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c == child || t0.contains(c)),
+        t1.node(child).empty(),
+        t1.node(parent) == t0.node(parent).update(idx, interior_entry(child)),
+        t1.level(parent) == t0.level(parent),
+        forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
+        forall|m: PFN| m != child ==> #[trigger] t1.xlate_base(m) == t0.xlate_base(m),
+        t1.va_map() == t0.va_map(),
+    ensures
+        t1.mapping_inv(),
+{
+    broadcast use lemma_node_struct_wf;
+
+    let ei = interior_entry(child);
+    assert(child != parent);
+    assert(t0.node(parent).e.dom().contains(idx));
+    assert forall|n: PFN, i: nat| (n != child && (n != parent || i != idx)) implies
+        #[trigger] t1.entry(n, i) == t0.entry(n, i) by {
+        if n == parent {
+            assert(t1.node(parent).e[i] == t0.node(parent).e.insert(idx, ei)[i]);
+        }
+    }
+    // leaf_at is unchanged everywhere: `child` is empty, the linked slot is interior.
+    assert forall|n: PFN, i: nat| #[trigger] t1.leaf_at(n, i) == t0.leaf_at(n, i) by {
+        if n == child {
+            assert(!t1.leaf_at(child, i));
+            assert(!t0.leaf_at(child, i));
+        } else if n == parent && i == idx {
+            assert(!t1.leaf_at(parent, idx));  // interior, level >= 1
+            assert(!t0.leaf_at(parent, idx));  // absent
+        } else {
+            assert(t1.entry(n, i) == t0.entry(n, i));
+        }
+    }
+    // a t0 leaf (n, i) is unchanged in t1 (n != child, (n,i) != (parent,idx)).
+    assert forall|n: PFN, i: nat| t0.leaf_at(n, i) implies (n != child && #[trigger] t1.entry(n, i)
+        == t0.entry(n, i) && t1.entry_vpn_base(n, i) == t0.entry_vpn_base(n, i)) by {}
+
+    // (Q): the t0 witness leaf (!= child) still records b.
+    assert forall|b: VPage| #[trigger] t1.va_map().dom().contains(b) implies {
+        let m = t1.va_map()[b];
+        &&& in_user_region(b)
+        &&& b % m.size.pages() == 0
+        &&& m.frame % m.size.pages() == 0
+        &&& exists|n: PFN| t1.records_leaf(b, m, n, pt_index(b, level_of_size(m.size)))
+    } by {
+        let m = t0.va_map()[b];
+        let ii = pt_index(b, level_of_size(m.size));
+        let w = choose|n: PFN| t0.records_leaf(b, m, n, ii);
+        assert(t0.records_leaf(b, m, w, ii));
+        assert(t0.leaf_at(w, ii) && w != child);
+        assert(t1.records_leaf(b, m, w, ii));
+    }
+    // (P): leaf_at and entry bases are unchanged, so every leaf is still recorded.
+    assert forall|n: PFN, i: nat|
+        (#[trigger] t1.leaf_at(n, i) && in_user_region(t1.entry_vpn_base(n, i)))
+            implies t1.va_map().dom().contains(t1.entry_vpn_base(n, i)) by {
+        assert(t0.leaf_at(n, i));
+    }
+}
+
+/// The mapping-layer companion to `lemma_link_child_preserves_tree_inv`: linking a
+/// fresh EMPTY child preserves `mapping_wf`. Kept THIN - each half in its own small
+/// context (see the soup lesson).
+pub proof fn lemma_link_child_preserves_mapping_wf<V: PtPage>(
+    t0: PageTablePerms<V>,
+    t1: PageTablePerms<V>,
+    parent: PFN,
+    idx: nat,
+    child: PFN,
+)
+    requires
+        t0.store_wf(),
+        t0.tree_inv(),
+        t0.mapping_wf(),
+        t0.contains(parent),
+        idx < ENTRIES,
+        t0.level(parent) >= 1,
+        !t0.node(parent).e[idx].present,
+        !(parent == t0.root() && idx == IDX_SELFMAP),
+        !t0.contains(child),
+        t1.root() == t0.root(),
+        forall|c: PFN| #[trigger] t1.contains(c) <==> (c == child || t0.contains(c)),
+        t1.node(child).empty(),
+        t1.level(child) == t0.level(parent) - 1,
+        t1.node(parent) == t0.node(parent).update(idx, interior_entry(child)),
+        t1.level(parent) == t0.level(parent),
+        forall|m: PFN| m != child && m != parent ==> #[trigger] t1.node(m) == t0.node(m),
+        forall|m: PFN| m != child ==> #[trigger] t1.level(m) == t0.level(m),
+        t1.xlate_base(child) == t0.entry_vpn_base(parent, idx),
+        forall|m: PFN| m != child ==> #[trigger] t1.xlate_base(m) == t0.xlate_base(m),
+        t1.va_map() == t0.va_map(),
+    ensures
+        t1.mapping_wf(),
+{
+    broadcast use lemma_node_struct_wf, lemma_node_level_bound;
+
+    // Derive the facts the xlate_wf half needs - freshness, root liveness/base - HERE
+    // (where the tree soup lives) so the sub-lemma contexts stay clean.
+    assert(t0.contains(t0.root()));
+    assert(t0.level(parent) <= ROOT_LEVEL);
+    assert forall|n: PFN, i: nat| #[trigger] t0.interior_at(n, i) implies t0.entry(n, i).target
+        != child by {
+        assert(t0.node_wf(n));
+    }
+    lemma_link_child_xlate_wf::<V>(t0, t1, parent, idx, child);
+    lemma_link_child_mapping_inv::<V>(t0, t1, parent, idx, child);
+}
+
 /// Allocate a fresh child table and link it under the absent slot `parent[idx]`,
 /// maintaining the table invariant. This is map's "grow the tree" primitive: the
 /// caller (a walk that hit an absent interior slot) passes the parent and the
@@ -1275,6 +1662,7 @@ pub fn alloc_child<V: PtPage>(
 ) -> (r: Result<(VA, usize), SvsmError>)
     requires
         old(perms).wf(),
+        old(perms).mapping_wf(),
         parent_va == old(perms).node_va(parent),
         parent_level as nat == old(perms).level(parent),
         parent_level >= 1,
@@ -1284,6 +1672,7 @@ pub fn alloc_child<V: PtPage>(
         !(parent == old(perms).root() && idx as nat == IDX_SELFMAP),
     ensures
         final(perms).wf(),
+        final(perms).mapping_wf(),
         final(perms).root() == old(perms).root(),
         r matches Ok((child_va, child_pfn)) ==> {
             &&& !old(perms).contains(child_pfn as nat)
@@ -1350,6 +1739,11 @@ pub fn alloc_child<V: PtPage>(
             }
         }
         lemma_link_child_preserves_tree_inv::<V>(t0, t1, parent, idx as nat, cp);
+        // mapping_wf: the structural base relationship + untouched va_map.
+        assert(t1.xlate_base(cp) == t0.entry_vpn_base(parent, idx as nat));
+        assert forall|m: PFN| m != cp implies #[trigger] t1.xlate_base(m) == t0.xlate_base(m) by {}
+        assert(t1.va_map() == t0.va_map());
+        lemma_link_child_preserves_mapping_wf::<V>(t0, t1, parent, idx as nat, cp);
     }
     Ok((child_va, child_pfn))
 }
@@ -1375,6 +1769,7 @@ pub proof fn lemma_singleton_table<V: PtPage>(rp: PFN, tracked root_perm: PTNode
         forall|i: nat| i < ENTRIES && i != IDX_SELFMAP ==> !(#[trigger] root_perm.node().e[i]).present,
     ensures
         perms.wf(),
+        perms.mapping_wf(),
         perms.root() == rp,
         perms.contains(rp),
         perms.node_va(rp) == root_perm.va(),
@@ -1417,6 +1812,41 @@ pub proof fn lemma_singleton_table<V: PtPage>(rp: PFN, tracked root_perm: PTNode
             (perms.contains(n) && i < ENTRIES && perms.node(n).e.dom().contains(i)) implies
                 entry_pinned(#[trigger] perms.entry(n, i)) by {}
     }
+    // mapping_wf: the only interior is the (permissive, self-map) link; no leaves;
+    // empty va_map.
+    assert(perms.xlate_base(rp) == 0);
+    assert(perms.interiors_permissive()) by {
+        assert forall|n: PFN, idx: nat| #[trigger] perms.interior_at(n, idx) implies permissive(
+            perms.entry(n, idx),
+        ) by {
+            assert(n == rp && idx == IDX_SELFMAP);
+        }
+    }
+    assert(perms.xlate_base_consistent()) by {
+        assert forall|p: PFN, idx: nat| (#[trigger] perms.interior_at(p, idx) && !perms.is_self_map(
+            p,
+            idx,
+        )) implies perms.xlate_base(perms.entry(p, idx).target) == perms.entry_vpn_base(p, idx) by {
+            assert(p == rp && idx == IDX_SELFMAP);  // contradicts !is_self_map
+        }
+    }
+    assert(perms.xlate_base_aligned()) by {
+        assert forall|n: PFN| #[trigger] perms.contains(n) implies perms.xlate_base(n) % span(
+            (perms.level(n) + 1) as nat,
+        ) == 0 by {
+            assert(n == rp);
+            assert(perms.xlate_base(n) == 0);
+            lemma_span_pos((perms.level(n) + 1) as nat);
+        }
+    }
+    assert(perms.mapping_inv()) by {
+        // va_map is empty; the singleton has no leaves, so (Q)/(C)/(D)/(P) are vacuous.
+        assert forall|n: PFN, idx: nat|
+            (#[trigger] perms.leaf_at(n, idx) && in_user_region(perms.entry_vpn_base(n, idx)))
+                implies perms.va_map().dom().contains(perms.entry_vpn_base(n, idx)) by {
+            assert(!perms.leaf_at(n, idx));
+        }
+    }
     perms
 }
 
@@ -1427,6 +1857,7 @@ pub fn new_root<V: PtPage>() -> (r: Result<(VA, usize, Tracked<PageTablePerms<V>
     ensures
         r matches Ok((root_va, root_pfn, perms)) ==> {
             &&& perms@.wf()
+            &&& perms@.mapping_wf()
             &&& perms@.root() == root_pfn as nat
             &&& perms@.contains(root_pfn as nat)
             &&& root_va == perms@.node_va(root_pfn as nat)

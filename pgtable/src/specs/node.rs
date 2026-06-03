@@ -24,7 +24,8 @@
 //
 // Compiled only under verification (`verus_only`).
 use crate::specs::perm::{
-    PA, PagePerm, VA, page_alloc_zeroed, page_borrow, page_borrow_mut, page_free, pfn_of, zeroed,
+    PA, PagePerm, VA, pa_page_aligned, page_alloc_zeroed, page_borrow, page_borrow_mut, page_free,
+    pfn_of, zeroed,
 };
 use crate::stubs::SvsmError;
 use vstd::prelude::*;
@@ -349,6 +350,7 @@ pub fn node_alloc<V: PtPage>(level: usize) -> (r: Result<
             &&& perm@.va() == va
             &&& perm@.pa() == pa
             &&& perm@.level() == level as nat
+            &&& pa_page_aligned(pa)
         },
 {
     let (va, pa, tpp) = match page_alloc_zeroed::<V>() {
@@ -359,6 +361,7 @@ pub fn node_alloc<V: PtPage>(level: usize) -> (r: Result<
     proof {
         V::zeroed_is_empty();
         assert(pp.value() == zeroed::<V>());
+        assert(pa_page_aligned(pa));  // page perm wf => its pa is 4K-aligned
     }
     let tracked node = PTNodePerm { perm: pp, level: level as nat };
     Ok((va, pa, Tracked(node)))
