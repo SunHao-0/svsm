@@ -74,6 +74,15 @@ pub struct VMap {
     pub enc: bool,
 }
 
+/// The paging level a leaf of size `sz` lives at (inverse of `size_of_level`).
+pub open spec fn level_of_size(sz: PageSz) -> nat {
+    match sz {
+        PageSz::Size4K => 0,
+        PageSz::Size2M => 1,
+        PageSz::Size1G => 2,
+    }
+}
+
 /// The effective permission is combined over EVERY entry on the walk (parents +
 /// leaf). The rule is architecture specific: x86 intersects (AND), an ARM-like
 /// arch unions (OR).
@@ -386,32 +395,43 @@ impl<V: PtPage> PageTablePerms<V> {
         b <= vpn < b + m.size.pages()
     }
 
-    /// The user-mapping invariant: `va_map`/`pa_map` faithfully record what the
-    /// walk resolves, one-to-one. Not yet part of `wf` - wired in once the bridge
-    /// lemma and `map`/`unmap` preservation are proven.
+    /// The `VMap` a leaf entry `(n, idx)` records: its target frame, the page size
+    /// for `n`'s level, the leaf's own permission, and its confidentiality bit.
+    pub open spec fn vmap_of_leaf(self, n: PFN, idx: nat) -> VMap {
+        VMap {
+            frame: self.entry(n, idx).target,
+            size: size_of_level(self.level(n)),
+            perm: leaf_only_perm(self.entry(n, idx)),
+            enc: self.entry(n, idx).enc,
+        }
+    }
+
+    /// The user-mapping invariant, stated LEAF-LOCALLY so a single leaf write moves
+    /// exactly one `va_map` key (no global walk reasoning per op). The walk-level
+    /// consistency you actually want - `walk(vpn)` agrees with `va_map` - is the
+    /// THEOREM `lemma_mapping_walk_coupling`, derived from this + the bridge lemmas.
+    /// Not yet part of `wf`.
     pub open spec fn mapping_inv(self) -> bool {
-        // (A) COMPLETE: every recorded mapping is realized by the walk, page by page.
+        // (Q) COMPLETE: every recorded mapping is a present user-region leaf sitting
+        // at the node the path names for its base/size - so the walk realizes it.
         &&& forall|b: VPage| #[trigger]
             self.va_map().dom().contains(b) ==> {
                 let m = self.va_map()[b];
+                let l = level_of_size(m.size);
+                let n = self.node_on_path(b, l)->Some_0;
+                &&& in_user_region(b)
                 &&& b % m.size.pages() == 0
                 &&& m.frame % m.size.pages() == 0
-                &&& forall|k: nat| k < m.size.pages() ==> {
-                    let w = (#[trigger] self.walk((b + k) as nat));
-                    &&& w is Some
-                    &&& w->Some_0.frame == (m.frame + k) as nat
-                    &&& w->Some_0.size == m.size
-                    &&& w->Some_0.perm == m.perm
-                    &&& w->Some_0.enc == m.enc
-                }
+                &&& self.node_on_path(b, l) is Some
+                &&& self.leaf_at(n, pt_index(b, l))
+                &&& self.entry_vpn_base(n, pt_index(b, l)) == b
+                &&& self.vmap_of_leaf(n, pt_index(b, l)) == m
             }
-        // (B) SOUND: every user-region walk leaf-resolution is a recorded mapping
-        // (the self-map subtree is excluded - it resolves PT pages, not user data).
-        &&& forall|vpn: VPage|
-            #![trigger self.walk(vpn)]
-            (self.walk(vpn) is Some && in_user_region(vpn)) ==> exists|b: VPage|
-                #![trigger self.va_map().dom().contains(b)]
-                self.va_map().dom().contains(b) && Self::vmap_covers(b, self.va_map()[b], vpn)
+        // (P) SOUND: every user-region leaf is recorded at its base - so the walk
+        // never resolves a user mapping we did not record.
+        &&& forall|n: PFN, idx: nat|
+            (#[trigger] self.leaf_at(n, idx) && in_user_region(self.entry_vpn_base(n, idx)))
+                ==> self.va_map().dom().contains(self.entry_vpn_base(n, idx))
         // (C) one-to-one: distinct mappings use disjoint data-frame ranges (the
         // pa side of the bijection, kept as a clause on `va_map_` - no inverse map).
         &&& forall|b1: VPage, b2: VPage|
@@ -608,6 +628,26 @@ pub proof fn lemma_span_pos(level: nat)
     }
 }
 
+/// For leaf levels (`<= 2`), size and level round-trip and the level's stride is
+/// exactly the size's page count.
+pub proof fn lemma_size_level_roundtrip(level: nat)
+    requires
+        level <= 2,
+    ensures
+        level_of_size(size_of_level(level)) == level,
+        span(level) == size_of_level(level).pages(),
+{
+    // Definitional by cases on level in {0, 1, 2}.
+    if level == 0 {
+    } else if level == 1 {
+        assert(span(1) == 512 * span(0));
+    } else {
+        assert(level == 2);
+        assert(span(2) == 512 * span(1));
+        assert(span(1) == 512 * span(0));
+    }
+}
+
 /// The structural derivation: a live node sits at the end of the walk path for the
 /// vpns in its range. Proven by walking UP from `n` to the root - each step uses
 /// connectivity (the unique parent interior link) and `xlate_base_consistent` to
@@ -655,6 +695,9 @@ pub proof fn lemma_node_on_path_eq<V: PtPage>(t: PageTablePerms<V>, n: PFN, vpn:
         assert(span((l + 2) as nat) == 512 * span((l + 1) as nat));
         // n's range sits inside p's range, so p covers vpn too.
         assert(t.node_covers(p, vpn)) by {
+            assert(idx * span((l + 1) as nat) + span((l + 1) as nat) == (idx + 1) * span(
+                (l + 1) as nat,
+            )) by (nonlinear_arith);
             assert((idx + 1) * span((l + 1) as nat) <= 512 * span((l + 1) as nat))
                 by (nonlinear_arith)
                 requires
@@ -692,8 +735,9 @@ pub proof fn lemma_reflects_walk<V: PtPage>(t: PageTablePerms<V>)
     ensures
         t.xlate_base_reflects_walk(),
 {
-    assert forall|n: PFN, vpn: VPage| (t.contains(n) && t.node_covers(n, vpn)) implies
-        t.node_on_path(vpn, t.level(n)) == Some(n) by {
+    assert forall|n: PFN, vpn: VPage|
+        #![trigger t.node_covers(n, vpn)]
+        (t.contains(n) && t.node_covers(n, vpn)) implies t.node_on_path(vpn, t.level(n)) == Some(n) by {
         lemma_node_on_path_eq::<V>(t, n, vpn);
     }
 }
@@ -791,6 +835,73 @@ pub proof fn lemma_leaf_walk<V: PtPage>(t: PageTablePerms<V>, n: PFN, idx: nat, 
     lemma_path_acc_identity::<V>(t, vpn, l);
     assert(t.entry(n, pt_index(vpn, l)).present);
     lemma_top_combine_is_leaf_only(t.entry(n, idx));
+}
+
+/// THE walk-consistency guarantee the page-table user gets: a recorded mapping is
+/// realized by the MMU walk, page by page, in frame/size/perm/enc. The leaf-local
+/// `mapping_inv` plus the bridge lemmas yield exactly the (former, global) clause
+/// (A) - so the user reasons about `va_map`, and the hardware walk agrees.
+#[verifier::rlimit(40)]
+pub proof fn lemma_mapping_walk_coupling<V: PtPage>(t: PageTablePerms<V>, b: VPage, k: nat)
+    requires
+        t.store_wf(),
+        t.tree_inv(),
+        t.xlate_base_consistent(),
+        t.xlate_base_aligned(),
+        t.interiors_permissive(),
+        t.mapping_inv(),
+        t.va_map().dom().contains(b),
+        k < t.va_map()[b].size.pages(),
+    ensures
+        t.walk((b + k) as nat) is Some,
+        t.walk((b + k) as nat)->Some_0.frame == (t.va_map()[b].frame + k) as nat,
+        t.walk((b + k) as nat)->Some_0.size == t.va_map()[b].size,
+        t.walk((b + k) as nat)->Some_0.perm == t.va_map()[b].perm,
+        t.walk((b + k) as nat)->Some_0.enc == t.va_map()[b].enc,
+{
+    broadcast use lemma_node_struct_wf, lemma_node_level_bound;
+
+    let m = t.va_map()[b];
+    let l = level_of_size(m.size);
+    let n = t.node_on_path(b, l)->Some_0;  // mapping_inv (Q): the leaf node
+    let idx = pt_index(b, l);
+    // mapping_inv (Q): the recorded mapping is a leaf at (n, idx), based at b.
+    assert(t.node_on_path(b, l) is Some && t.leaf_at(n, idx) && t.vmap_of_leaf(n, idx) == m
+        && t.entry_vpn_base(n, idx) == b);
+    // The leaf sits at level l (leaves are at level <= 2, so size<->level round-trips).
+    assert(t.node_wf(n));
+    assert(t.level(n) <= 2);
+    lemma_size_level_roundtrip(t.level(n));
+    assert(t.level(n) == l);
+    lemma_span_pos(l);
+    assert(span(l) == m.size.pages());
+    assert(b % span(l) == 0);
+    assert(t.xlate_base(n) + idx * span(l) == b);  // entry_vpn_base(n, idx) == b
+    assert(t.xlate_base(n) % span((l + 1) as nat) == 0);  // xlate_base_aligned
+    assert(span((l + 1) as nat) == 512 * span(l));
+
+    let vpn = (b + k) as nat;
+    // b+k stays inside entry idx of n, so n covers it and the index there is idx.
+    assert(t.node_covers(n, vpn)) by {
+        assert(idx * span(l) + span(l) == (idx + 1) * span(l)) by (nonlinear_arith);
+        assert((idx + 1) * span(l) <= 512 * span(l)) by (nonlinear_arith)
+            requires
+                idx < 512,
+                span(l) >= 0,
+        ;
+    }
+    assert(idx == pt_index(vpn, l)) by {
+        lemma_pt_index_in_entry(t.xlate_base(n), span(l), span((l + 1) as nat), idx, vpn);
+    }
+    assert(vpn % span(l) == k) by (nonlinear_arith)
+        requires
+            b % span(l) == 0,
+            k < span(l),
+            span(l) > 0,
+            vpn == b + k,
+    ;
+    lemma_reflects_walk::<V>(t);
+    lemma_leaf_walk::<V>(t, n, idx, vpn);
 }
 
 // =====================================================================
